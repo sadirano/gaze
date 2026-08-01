@@ -1,0 +1,14 @@
+[actions]
+# ReleaseFast is not optional here: this binary's whole reason to exist is
+# process start time, and a Debug build gives most of that back.
+# --sync-bin keeps the global gaze.exe copy in ~/.nix/bin current (a stale copy
+# is otherwise only caught by nix --doctor).
+build = "zig build -Doptimize=ReleaseFast && nix --sync-bin"
+test = "zig build test"
+
+# Render a sample payload so a change to the line can be eyeballed.
+demo = "zig build -Doptimize=ReleaseFast && scripts/demo.sh"
+
+# Globally runnable via ~/.nix/bin (installed by `nix --sync-bin`).
+[bin]
+gaze = "zig-out/bin/gaze.exe"

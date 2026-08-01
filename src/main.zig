@@ -1,0 +1,497 @@
+//! gaze - the Claude Code status line, as a native binary.
+//!
+//! Claude Code hands a JSON blob on stdin and prints whatever single line comes
+//! back, on every redraw. The shell ports this replaces spent 400-650ms per
+//! render, and ~95% of that was starting a language runtime to do ~1ms of
+//! arithmetic. Everything here is that arithmetic, plus two files read off disk.
+//!
+//! Renders:
+//!   (<alias>) <rel-path> > <model>  <branch> <clean|*dirty>  <owl><n>
+//!   <5h%> / <7d%>  #<context%>  @<cached>  $<cost>  +<add>/-<del>  <dur>  <clock>
+//!
+//! Every segment is optional and simply absent when its data is missing, so a
+//! payload with fewer fields renders a shorter line rather than an error.
+
+const std = @import("std");
+const Io = std.Io;
+const git = @import("git.zig");
+const dirty_mod = @import("dirty.zig");
+const hoot_mod = @import("hoot.zig");
+const cache = @import("cache.zig");
+
+const usage =
+    \\gaze - Claude Code status line
+    \\
+    \\Reads the status line JSON on stdin, writes one rendered line on stdout.
+    \\
+    \\  --dirty-ttl <seconds>  how often to re-check git for uncommitted changes
+    \\                         (default 10; 0 re-checks on every render)
+    \\  --hoot-ttl <seconds>   how often to re-check the hoot unseen count
+    \\                         (default 10; 0 re-checks on every render)
+    \\  --no-dirty             never check git; show the branch alone
+    \\  --no-hoot              never check hoot; drop the badge
+    \\  -h, --help             this text
+    \\
+    \\GAZE_DIRTY_TTL and GAZE_HOOT_TTL set the same intervals; flags win.
+    \\
+    \\Both of those answers cost a process spawn (~37ms and ~26ms), far more
+    \\than everything else here put together, and neither changes anywhere near
+    \\as often as the line redraws - so both are polled on an interval and can
+    \\lag by up to it. The branch itself is always current: it is read straight
+    \\from .git/HEAD, which is just a file.
+    \\
+;
+
+/// How often the polled segments are refreshed when nothing says otherwise. Ten
+/// seconds is short enough that a change shows up while you are still looking at
+/// what caused it, and long enough that the spawn cost is a rounding error.
+const default_ttl_s: u32 = 10;
+
+const Config = struct {
+    dirty_ttl_s: u32 = default_ttl_s,
+    hoot_ttl_s: u32 = default_ttl_s,
+    check_dirty: bool = true,
+    check_hoot: bool = true,
+};
+
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const io = init.io;
+
+    var out_buf: [8192]u8 = undefined;
+    var out_fw: Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
+    const out = &out_fw.interface;
+    defer out.flush() catch {};
+
+    const args = try init.minimal.args.toSlice(arena);
+    const cfg = parseArgs(arena, args[1..], init.environ_map) catch {
+        try out.writeAll(usage);
+        return;
+    };
+    if (cfg == null) {
+        try out.writeAll(usage);
+        return;
+    }
+
+    // Read stdin whole. 256KB is far above any real payload; a larger one is
+    // truncated rather than refused, since a clipped status line still beats none.
+    const raw = readAllStdin(arena, io) catch "";
+    if (raw.len == 0) {
+        try out.writeAll("> ?\n");
+        return;
+    }
+
+    const parsed = std.json.parseFromSlice(std.json.Value, arena, raw, .{}) catch {
+        try out.writeAll("> ?\n");
+        return;
+    };
+    const root = parsed.value;
+
+    var line: Line = .{ .w = out };
+    try render(arena, io, &line, root, cfg.?, init.environ_map);
+    try out.writeAll("\n");
+}
+
+/// Returns null when help was asked for, an error on a malformed flag.
+fn parseArgs(
+    arena: std.mem.Allocator,
+    args: []const [:0]const u8,
+    env: *std.process.Environ.Map,
+) !?Config {
+    var cfg: Config = .{};
+
+    // Env first so an explicit flag can override it.
+    if (envTtl(env, "GAZE_DIRTY_TTL")) |n| cfg.dirty_ttl_s = n;
+    if (envTtl(env, "GAZE_HOOT_TTL")) |n| cfg.hoot_ttl_s = n;
+    _ = arena;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) return null;
+        if (std.mem.eql(u8, a, "--no-dirty")) {
+            cfg.check_dirty = false;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-hoot")) {
+            cfg.check_hoot = false;
+            continue;
+        }
+        if (try ttlFlag(args, &i, "--dirty-ttl")) |n| {
+            cfg.dirty_ttl_s = n;
+            continue;
+        }
+        if (try ttlFlag(args, &i, "--hoot-ttl")) |n| {
+            cfg.hoot_ttl_s = n;
+            continue;
+        }
+        return error.UnknownFlag;
+    }
+    return cfg;
+}
+
+fn envTtl(env: *std.process.Environ.Map, name: []const u8) ?u32 {
+    const v = env.get(name) orelse return null;
+    return std.fmt.parseInt(u32, std.mem.trim(u8, v, " \t"), 10) catch null;
+}
+
+/// Accepts both `--flag 5` and `--flag=5`; the latter is what reads cleanly
+/// inside a settings.json command string, where quoting separate words is fiddly.
+fn ttlFlag(args: []const [:0]const u8, i: *usize, name: []const u8) !?u32 {
+    const a = args[i.*];
+    if (std.mem.eql(u8, a, name)) {
+        i.* += 1;
+        if (i.* >= args.len) return error.MissingValue;
+        return try std.fmt.parseInt(u32, args[i.*], 10);
+    }
+    if (a.len > name.len and std.mem.startsWith(u8, a, name) and a[name.len] == '=') {
+        return try std.fmt.parseInt(u32, a[name.len + 1 ..], 10);
+    }
+    return null;
+}
+
+fn readAllStdin(arena: std.mem.Allocator, io: Io) ![]const u8 {
+    const buf = try arena.alloc(u8, 256 * 1024);
+    var total: usize = 0;
+    while (total < buf.len) {
+        var iov = [_][]u8{buf[total..]};
+        const n = Io.File.stdin().readStreaming(io, &iov) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    return buf[0..total];
+}
+
+// ---------------------------------------------------------------- rendering
+
+const sep = "  ";
+
+/// Writes segments separated by two spaces, so each segment can be emitted
+/// without every caller having to know whether it is the first one.
+const Line = struct {
+    w: *Io.Writer,
+    started: bool = false,
+
+    fn seg(self: *Line) !void {
+        if (self.started) try self.w.writeAll(sep);
+        self.started = true;
+    }
+
+    fn color(self: *Line, code: []const u8, text: []const u8) !void {
+        try self.w.print("\x1b[{s}m{s}\x1b[0m", .{ code, text });
+    }
+};
+
+fn render(
+    arena: std.mem.Allocator,
+    io: Io,
+    line: *Line,
+    root: std.json.Value,
+    cfg: Config,
+    env: *std.process.Environ.Map,
+) !void {
+    const cwd = strAt(root, &.{"cwd"}) orelse strAt(root, &.{ "workspace", "current_dir" }) orelse "";
+    const model = strAt(root, &.{ "model", "display_name" }) orelse "?";
+
+    // --- (alias) path > model ---
+    try line.seg();
+    const alias = env.get("NIX_ALIAS");
+    const alias_root = env.get("NIX_ALIAS_PATH");
+    if (relativeToAlias(cwd, alias_root)) |rel| {
+        if (alias) |a| {
+            try line.color("33", try std.fmt.allocPrint(arena, "({s})", .{a}));
+            if (rel.len > 0) {
+                try line.w.writeAll(" ");
+                try line.color("36", rel);
+            }
+        } else try line.color("36", cwd);
+    } else {
+        if (alias) |a| {
+            try line.color("33", try std.fmt.allocPrint(arena, "({s})", .{a}));
+            try line.w.writeAll(" ");
+        }
+        try line.color("36", cwd);
+    }
+    try line.color("90", " > ");
+    try line.color("35", model);
+
+    // --- branch + dirty ---
+    if (cwd.len > 0) {
+        if (git.find(arena, io, cwd)) |repo| {
+            if (repo.branch) |b| {
+                try line.seg();
+                try line.color("36", b);
+                if (cfg.check_dirty) {
+                    const state = dirty_mod.check(arena, io, repo.git_dir, repo.work_dir, cfg.dirty_ttl_s, tmpDir(env));
+                    switch (state) {
+                        .dirty => {
+                            try line.w.writeAll(" ");
+                            try line.color("33", "*dirty");
+                        },
+                        .clean => {
+                            try line.w.writeAll(" ");
+                            try line.color("32", "clean");
+                        },
+                        .unknown => {},
+                    }
+                }
+            }
+        }
+    }
+
+    // --- hoot unseen badge ---
+    if (cfg.check_hoot) {
+        if (hoot_mod.count(arena, io, cfg.hoot_ttl_s, tmpDir(env))) |n| {
+            if (n > 0) {
+                try line.seg();
+                try line.color("33", try std.fmt.allocPrint(arena, "\u{1F989}{d}", .{n}));
+            }
+        }
+    }
+
+    // --- quota: 5h / 7d, red past 80% ---
+    const h5 = numAt(root, &.{ "rate_limits", "five_hour", "used_percentage" });
+    const d7 = numAt(root, &.{ "rate_limits", "seven_day", "used_percentage" });
+    if (h5 != null or d7 != null) {
+        try line.seg();
+        try quotaSeg(arena, io, line, h5, numAt(root, &.{ "rate_limits", "five_hour", "resets_at" }));
+        try line.color("33", " / ");
+        try quotaSeg(arena, io, line, d7, numAt(root, &.{ "rate_limits", "seven_day", "resets_at" }));
+    }
+
+    // --- context window ---
+    if (numAt(root, &.{ "context_window", "used_percentage" })) |ctx| {
+        try line.seg();
+        try line.color("32", try std.fmt.allocPrint(arena, "#{d}%", .{@as(i64, @intFromFloat(ctx))}));
+    }
+
+    // --- cached tokens ---
+    const cr = numAt(root, &.{ "context_window", "current_usage", "cache_read_input_tokens" }) orelse 0;
+    const cc = numAt(root, &.{ "context_window", "current_usage", "cache_creation_input_tokens" }) orelse 0;
+    const cached: i64 = @intFromFloat(cr + cc);
+    if (cached > 0) {
+        try line.seg();
+        try line.color("90", try std.fmt.allocPrint(arena, "@{s}", .{try formatTokens(arena, cached)}));
+    }
+
+    // --- session cost, hidden below half a cent ---
+    if (numAt(root, &.{ "cost", "total_cost_usd" })) |cost| {
+        if (@round(cost * 100.0) / 100.0 > 0.0) {
+            try line.seg();
+            try line.color("92", try formatCost(arena, cost));
+        }
+    }
+
+    // --- lines added / removed ---
+    const added: i64 = @intFromFloat(numAt(root, &.{ "cost", "total_lines_added" }) orelse 0);
+    const removed: i64 = @intFromFloat(numAt(root, &.{ "cost", "total_lines_removed" }) orelse 0);
+    if (added > 0 or removed > 0) {
+        try line.seg();
+        try line.color("32", try std.fmt.allocPrint(arena, "+{d}", .{added}));
+        try line.color("90", "/");
+        try line.color("31", try std.fmt.allocPrint(arena, "-{d}", .{removed}));
+    }
+
+    // --- session duration ---
+    if (numAt(root, &.{ "cost", "total_duration_ms" })) |ms| {
+        if (ms > 0) {
+            try line.seg();
+            try line.color("90", try formatDuration(arena, @intFromFloat(ms)));
+        }
+    }
+
+    // --- wall clock ---
+    try line.seg();
+    try line.color("90", try localHhMm(arena, io));
+}
+
+fn quotaSeg(arena: std.mem.Allocator, io: Io, line: *Line, pct: ?f64, resets_at: ?f64) !void {
+    const p = pct orelse 0;
+    const code: []const u8 = if (p > 80) "31" else "33";
+    try line.color(code, try std.fmt.allocPrint(arena, "{d}%", .{@as(i64, @intFromFloat(p))}));
+    if (resets_at) |r| {
+        if (timeLeft(arena, cache.nowSeconds(io), @intFromFloat(r))) |t| {
+            try line.color("90", try std.fmt.allocPrint(arena, " {s}", .{t}));
+        }
+    }
+}
+
+/// "@2h15m" / "@45m" until the given unix timestamp, or null once it has passed.
+/// `now` is passed in rather than read here so the formatting is testable.
+fn timeLeft(arena: std.mem.Allocator, now: i64, unix: i64) ?[]const u8 {
+    if (unix == 0) return null;
+    const diff = unix - now;
+    if (diff <= 0) return null;
+    const h = @divTrunc(diff, 3600);
+    const m = @divTrunc(@rem(diff, 3600), 60);
+    return if (h > 0)
+        std.fmt.allocPrint(arena, "@{d}h{d}m", .{ h, m }) catch null
+    else
+        std.fmt.allocPrint(arena, "@{d}m", .{m}) catch null;
+}
+
+/// "$1,234.50" - comma-grouped to match what the shell ports rendered, since a
+/// long-running session's cost is easier to read at a glance with the grouping.
+/// Always ASCII, never locale-dependent, so it looks the same on any machine.
+fn formatCost(arena: std.mem.Allocator, cost: f64) ![]const u8 {
+    const cents: i64 = @intFromFloat(@round(cost * 100.0));
+    const whole = @divTrunc(cents, 100);
+    // Unsigned: a zero-filled signed value formats with an explicit '+' sign.
+    const frac: u64 = @intCast(@rem(cents, 100));
+
+    var digits: [32]u8 = undefined;
+    const d = try std.fmt.bufPrint(&digits, "{d}", .{whole});
+
+    var buf: [48]u8 = undefined;
+    var n: usize = 0;
+    buf[n] = '$';
+    n += 1;
+    for (d, 0..) |c, i| {
+        // A separator every three digits, counting from the right.
+        if (i > 0 and (d.len - i) % 3 == 0) {
+            buf[n] = ',';
+            n += 1;
+        }
+        buf[n] = c;
+        n += 1;
+    }
+    const tail = try std.fmt.bufPrint(buf[n..], ".{d:0>2}", .{frac});
+    return arena.dupe(u8, buf[0 .. n + tail.len]);
+}
+
+fn formatTokens(arena: std.mem.Allocator, n: i64) ![]const u8 {
+    const f: f64 = @floatFromInt(n);
+    if (n >= 1_000_000) return std.fmt.allocPrint(arena, "{d:.1}M", .{f / 1_000_000.0});
+    if (n >= 1_000) return std.fmt.allocPrint(arena, "{d:.1}k", .{f / 1_000.0});
+    return std.fmt.allocPrint(arena, "{d}", .{n});
+}
+
+fn formatDuration(arena: std.mem.Allocator, ms: i64) ![]const u8 {
+    const s = @divTrunc(ms, 1000);
+    if (s >= 3600) return std.fmt.allocPrint(arena, "{d}h{d}m", .{ @divTrunc(s, 3600), @divTrunc(@rem(s, 3600), 60) });
+    if (s >= 60) return std.fmt.allocPrint(arena, "{d}m", .{@divTrunc(s, 60)});
+    return std.fmt.allocPrint(arena, "{d}s", .{s});
+}
+
+// Windows hands us local wall-clock time directly, which sidesteps needing a
+// timezone database just to print HH:MM. Elsewhere we fall back to UTC.
+const SYSTEMTIME = extern struct {
+    wYear: u16,
+    wMonth: u16,
+    wDayOfWeek: u16,
+    wDay: u16,
+    wHour: u16,
+    wMinute: u16,
+    wSecond: u16,
+    wMilliseconds: u16,
+};
+extern "kernel32" fn GetLocalTime(lpSystemTime: *SYSTEMTIME) callconv(.winapi) void;
+
+fn localHhMm(arena: std.mem.Allocator, io: Io) ![]const u8 {
+    if (@import("builtin").os.tag == .windows) {
+        var st: SYSTEMTIME = undefined;
+        GetLocalTime(&st);
+        return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}", .{ st.wHour, st.wMinute });
+    }
+    // Elsewhere this is UTC: printing local time would mean carrying a timezone
+    // database for two digits, and the platform this targets is handled above.
+    const secs = @mod(cache.nowSeconds(io), 86400);
+    return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}", .{ @divTrunc(secs, 3600), @divTrunc(@rem(secs, 3600), 60) });
+}
+
+/// Where the dirty cache lives. Falls back to the current directory rather than
+/// failing, since a missing cache only costs a git call.
+fn tmpDir(env: *std.process.Environ.Map) []const u8 {
+    return env.get("TEMP") orelse env.get("TMPDIR") orelse ".";
+}
+
+// ------------------------------------------------------------ small helpers
+
+/// `cwd` with the alias root stripped: "" exactly at the root, null when `cwd`
+/// is not under it at all (caller then prints the absolute path).
+///
+/// The separator check matters: without it "/srv/proj/owl-extra" would count as
+/// living under "/srv/proj/owl" and render as a sibling's subdirectory.
+fn relativeToAlias(cwd: []const u8, alias_root: ?[]const u8) ?[]const u8 {
+    const root_raw = alias_root orelse return null;
+    if (root_raw.len == 0 or cwd.len == 0) return null;
+    const root = std.mem.trimEnd(u8, root_raw, "\\/");
+    const trimmed_cwd = std.mem.trimEnd(u8, cwd, "\\/");
+
+    if (std.ascii.eqlIgnoreCase(trimmed_cwd, root)) return "";
+    if (trimmed_cwd.len <= root.len + 1) return null;
+    if (!std.ascii.eqlIgnoreCase(trimmed_cwd[0..root.len], root)) return null;
+    const c = trimmed_cwd[root.len];
+    if (c != '\\' and c != '/') return null;
+    return trimmed_cwd[root.len + 1 ..];
+}
+
+fn at(root: std.json.Value, path: []const []const u8) ?std.json.Value {
+    var cur = root;
+    for (path) |key| {
+        if (cur != .object) return null;
+        cur = cur.object.get(key) orelse return null;
+    }
+    return cur;
+}
+
+fn strAt(root: std.json.Value, path: []const []const u8) ?[]const u8 {
+    const v = at(root, path) orelse return null;
+    return switch (v) {
+        .string => |s| if (s.len == 0) null else s,
+        else => null,
+    };
+}
+
+fn numAt(root: std.json.Value, path: []const []const u8) ?f64 {
+    const v = at(root, path) orelse return null;
+    return switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        else => null,
+    };
+}
+
+// ------------------------------------------------------------------- tests
+
+test "relativeToAlias strips the root" {
+    try std.testing.expectEqualStrings("src\\core", relativeToAlias("C:\\proj\\owl\\src\\core", "C:\\proj\\owl").?);
+    try std.testing.expectEqualStrings("", relativeToAlias("C:\\proj\\owl", "C:\\proj\\owl").?);
+    try std.testing.expectEqualStrings("src", relativeToAlias("/srv/owl/src", "/srv/owl/").?);
+}
+
+test "relativeToAlias refuses a sibling with a shared prefix" {
+    try std.testing.expect(relativeToAlias("/srv/proj/owl-extra", "/srv/proj/owl") == null);
+    try std.testing.expect(relativeToAlias("/etc/other", "/srv/proj/owl") == null);
+    try std.testing.expect(relativeToAlias("/srv/owl", null) == null);
+}
+
+test "formatCost groups thousands and keeps two decimals" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const g = a.allocator();
+    try std.testing.expectEqualStrings("$1.42", try formatCost(g, 1.4237));
+    try std.testing.expectEqualStrings("$0.01", try formatCost(g, 0.006));
+    try std.testing.expectEqualStrings("$999.99", try formatCost(g, 999.99));
+    try std.testing.expectEqualStrings("$1,234.50", try formatCost(g, 1234.5));
+    try std.testing.expectEqualStrings("$12,345.68", try formatCost(g, 12345.678));
+    try std.testing.expectEqualStrings("$1,000,000.00", try formatCost(g, 1000000.0));
+}
+
+test "formatTokens uses k and M suffixes" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const g = a.allocator();
+    try std.testing.expectEqualStrings("999", try formatTokens(g, 999));
+    try std.testing.expectEqualStrings("1.2k", try formatTokens(g, 1240));
+    try std.testing.expectEqualStrings("1.3M", try formatTokens(g, 1_271_000));
+}
+
+test "formatDuration picks the coarsest useful unit" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const g = a.allocator();
+    try std.testing.expectEqualStrings("8s", try formatDuration(g, 8200));
+    try std.testing.expectEqualStrings("47m", try formatDuration(g, 2_820_000));
+    try std.testing.expectEqualStrings("1h15m", try formatDuration(g, 4_530_000));
+}
