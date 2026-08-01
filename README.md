@@ -94,16 +94,25 @@ Then point Claude Code at it in `~/.claude/settings.json`:
 }
 ```
 
-Before `nix --sync-bin` has installed it, use the built path directly:
+Before `nix --sync-bin` has installed it, use the built path directly - with
+**forward slashes**:
 
 ```json
 {
   "statusLine": {
     "type": "command",
-    "command": "C:\\path\\to\\gaze\\zig-out\\bin\\gaze.exe"
+    "command": "C:/path/to/gaze/zig-out/bin/gaze.exe"
   }
 }
 ```
+
+Backslashes do not work here, and fail in a way that looks like gaze is broken.
+Claude Code runs this command through a shell, so a JSON `"C:\\path\\to.exe"`
+reaches the shell as `C:\path\to.exe`, where the backslashes are escape
+characters and vanish: the shell then reports `C:pathto.exe: command not found`.
+Forward slashes survive both a POSIX shell and PowerShell, and Windows accepts
+them for execution. This is the same reason the shell status lines it replaced
+were written as `"$HOME/.dotfiles/..."`.
 
 ## Development
 

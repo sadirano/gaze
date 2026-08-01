@@ -68,3 +68,20 @@ any alias, a sibling directory sharing an alias prefix. The last one matters:
   database for two digits. Other platforms fall back to UTC.
 - `{d:0>2}` on a **signed** integer formats with an explicit `+`. Cast to
   unsigned before zero-filling, or you get `$1.+42`.
+- The `statusLine` command in settings.json is run **through a shell**, so the
+  path must use forward slashes. A backslash path reaches the shell as escape
+  characters and collapses (`C:\a\b.exe` -> `C:ab.exe`, "command not found"),
+  which presents as "gaze is broken" rather than as a config error.
+
+## Testing changes to the rendered line
+
+Beware two traps that make a working binary look broken - both cost real time
+during development:
+
+- **Shell-mangled test payloads.** `echo '{"cwd":"C:\\x"}'` emits `C:\x` under
+  some shells, which is invalid JSON, and gaze correctly prints `> ?`. Build
+  payloads with a JSON library (see the parity harness approach in git history)
+  or use forward slashes in test paths.
+- **Git Bash path translation.** MSYS rewrites POSIX-looking arguments and env
+  vars when handing them to native binaries, so `NIX_ALIAS_PATH=/srv/x` may not
+  arrive as written. `MSYS2_ARG_CONV_EXCL='*'` disables it for a test run.
