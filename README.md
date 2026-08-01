@@ -77,13 +77,16 @@ them cached, which is the point of the cache.
 
 ## Install
 
-Build and put it on PATH via nix:
+Register the project with [nix](https://github.com/sadirano/nix), then build:
 
 ```
-x gaze :build      # zig build -Doptimize=ReleaseFast && nix --sync-bin
+nix gaze <path/to/this/checkout>   # once
+x gaze :build                      # ReleaseFast + nix --sync-bin
 ```
 
-Then point Claude Code at it in `~/.claude/settings.json`:
+`:build` ends in `nix --sync-bin`, which installs the `[bin]` export from
+`.nix/actions.toml` into `~/.nix/bin` - already on PATH. Point Claude Code at
+the name in `~/.claude/settings.json`:
 
 ```json
 {
@@ -94,25 +97,23 @@ Then point Claude Code at it in `~/.claude/settings.json`:
 }
 ```
 
-Before `nix --sync-bin` has installed it, use the built path directly - with
-**forward slashes**:
+That is the whole config. **Nothing here should name a filesystem location.**
+Knowing where files live is nix's job: it holds the alias, it owns the copy in
+`~/.nix/bin`, and it re-syncs that copy on every build. Moving this checkout
+then costs one `nix gaze <new path>` and touches nothing else - not this repo,
+not settings.json, not any script that calls it.
 
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "C:/path/to/gaze/zig-out/bin/gaze.exe"
-  }
-}
-```
+An absolute path in a config file is a smell, not a shortcut. It means nix was
+skipped, and it will rot the moment anything moves. Concretely, this project
+already paid for that twice: a path pointing into `zig-out` broke as soon as the
+repo was going to move, and before that a JSON `"C:\\path\\to.exe"` failed
+outright, because Claude Code runs the command through a shell where the
+backslashes are escape characters and collapse (`C:pathto.exe: command not
+found`). The bare name has neither failure mode.
 
-Backslashes do not work here, and fail in a way that looks like gaze is broken.
-Claude Code runs this command through a shell, so a JSON `"C:\\path\\to.exe"`
-reaches the shell as `C:\path\to.exe`, where the backslashes are escape
-characters and vanish: the shell then reports `C:pathto.exe: command not found`.
-Forward slashes survive both a POSIX shell and PowerShell, and Windows accepts
-them for execution. This is the same reason the shell status lines it replaced
-were written as `"$HOME/.dotfiles/..."`.
+If you are running without nix, the fallback is the built binary's path with
+**forward slashes** (`C:/path/to/gaze/zig-out/bin/gaze.exe`) - but prefer fixing
+the nix registration over carrying the path.
 
 ## Development
 
