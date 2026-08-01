@@ -97,23 +97,31 @@ the name in `~/.claude/settings.json`:
 }
 ```
 
-That is the whole config. **Nothing here should name a filesystem location.**
-Knowing where files live is nix's job: it holds the alias, it owns the copy in
-`~/.nix/bin`, and it re-syncs that copy on every build. Moving this checkout
-then costs one `nix gaze <new path>` and touches nothing else - not this repo,
-not settings.json, not any script that calls it.
+nix keeps the alias and the `~/.nix/bin` copy in step, so the config only needs
+the name. Moving this checkout is then one `nix gaze <new path>`, with nothing
+else to update.
 
-An absolute path in a config file is a smell, not a shortcut. It means nix was
-skipped, and it will rot the moment anything moves. Concretely, this project
-already paid for that twice: a path pointing into `zig-out` broke as soon as the
-repo was going to move, and before that a JSON `"C:\\path\\to.exe"` failed
-outright, because Claude Code runs the command through a shell where the
-backslashes are escape characters and collapse (`C:pathto.exe: command not
-found`). The bare name has neither failure mode.
+### Without nix
 
-If you are running without nix, the fallback is the built binary's path with
-**forward slashes** (`C:/path/to/gaze/zig-out/bin/gaze.exe`) - but prefer fixing
-the nix registration over carrying the path.
+Point at the built binary directly, using **forward slashes**:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "C:/path/to/gaze/zig-out/bin/gaze.exe"
+  }
+}
+```
+
+Backslashes will not work here. Claude Code runs this command through a shell,
+so a JSON `"C:\\path\\to.exe"` arrives as `C:\path\to.exe`, the backslashes are
+read as escape characters, and you get `C:pathto.exe: command not found` - which
+looks like gaze failing rather than a bad path. Forward slashes work in both
+POSIX shells and PowerShell, and Windows accepts them for execution.
+
+Note that this path points inside `zig-out`, so it needs updating whenever the
+checkout moves.
 
 ## Development
 
