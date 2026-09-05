@@ -30,7 +30,8 @@ Left to right, each one absent when its data is missing or zero:
 - **`branch clean|*dirty`** - see below.
 - **`🦉n`** - unseen hoot notifications; hidden when the inbox is empty or hoot
   is not installed.
-- **`5h% / 7d%`** - rate limit windows with time until reset, red past 80%.
+- **`5h% / 7d%`** - rate limit windows with time until reset, red past 80%. Both
+  are also appended to a quota log; see below.
 - **`#n%`** - context window used.
 - **`@n`** - cached context tokens (`cache_read + cache_creation`), k/M suffixed.
 - **`$n`** - session cost, hidden below half a cent so a fresh session shows
@@ -65,6 +66,7 @@ is a single short file, so it is always current and effectively free.
 --hoot-ttl <seconds>    how often to re-check hoot     (default 10; 0 = every render)
 --no-dirty              never check git; branch alone
 --no-hoot               never check hoot; drop the badge
+--no-quota-log          do not append quota samples to the log
 -h, --help
 ```
 
@@ -74,6 +76,25 @@ better inside a `settings.json` command string.
 
 Turning both off (`--no-dirty --no-hoot`) renders in 7.0ms - the same as leaving
 them cached, which is the point of the cache.
+
+## The quota log
+
+The weekly allowance does not roll over, so pace matters as much as level - and
+the payload only ever carries the level. Each render therefore appends its
+sample to `%LOCALAPPDATA%\gaze\quota.log` (`GAZE_QUOTA_DIR` overrides the
+directory):
+
+```
+<unix ts>  <5h pct>  <5h reset>  <7d pct>  <7d reset>
+```
+
+Tab separated, absent fields as `-1`. A line is written when the seven-day
+percentage moves, and otherwise at most once every five minutes, so an idle
+redraw loop writes nothing and a busy one writes about one line per point.
+
+This costs one 128-byte read on the common path and no process spawn. As with
+every other segment, failure is silent: an unwritable log costs a gap in the
+history and never a status line.
 
 ## Install
 

@@ -17,6 +17,7 @@ const Io = std.Io;
 const git = @import("git.zig");
 const dirty_mod = @import("dirty.zig");
 const hoot_mod = @import("hoot.zig");
+const quota_mod = @import("quota.zig");
 const cache = @import("cache.zig");
 
 const usage =
@@ -30,9 +31,15 @@ const usage =
     \\                         (default 10; 0 re-checks on every render)
     \\  --no-dirty             never check git; show the branch alone
     \\  --no-hoot              never check hoot; drop the badge
+    \\  --no-quota-log         do not append quota samples to the log
     \\  -h, --help             this text
     \\
     \\GAZE_DIRTY_TTL and GAZE_HOOT_TTL set the same intervals; flags win.
+    \\
+    \\The 5h and 7d percentages are also appended to <GAZE_QUOTA_DIR, or
+    \\%LOCALAPPDATA%\gaze>\quota.log, one line per change, so that pace over the
+    \\week can be computed from them. A weekly allowance that does not roll over
+    \\needs the history; the payload only ever carries the current level.
     \\
     \\Both of those answers cost a process spawn (~37ms and ~26ms), far more
     \\than everything else here put together, and neither changes anywhere near
@@ -47,11 +54,18 @@ const usage =
 /// what caused it, and long enough that the spawn cost is a rounding error.
 const default_ttl_s: u32 = 10;
 
+/// How often an unchanged quota percentage is re-sampled. The percentage itself
+/// is logged the moment it moves, so this only bounds how stale the last line
+/// can be while nothing is being spent.
+const default_quota_interval_s: i64 = 300;
+
 const Config = struct {
     dirty_ttl_s: u32 = default_ttl_s,
     hoot_ttl_s: u32 = default_ttl_s,
     check_dirty: bool = true,
     check_hoot: bool = true,
+    quota_log: bool = true,
+    quota_interval_s: i64 = default_quota_interval_s,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -115,6 +129,10 @@ fn parseArgs(
         }
         if (std.mem.eql(u8, a, "--no-hoot")) {
             cfg.check_hoot = false;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-quota-log")) {
+            cfg.quota_log = false;
             continue;
         }
         if (try ttlFlag(args, &i, "--dirty-ttl")) |n| {
@@ -252,11 +270,25 @@ fn render(
     // --- quota: 5h / 7d, red past 80% ---
     const h5 = numAt(root, &.{ "rate_limits", "five_hour", "used_percentage" });
     const d7 = numAt(root, &.{ "rate_limits", "seven_day", "used_percentage" });
+    const h5_reset = numAt(root, &.{ "rate_limits", "five_hour", "resets_at" });
+    const d7_reset = numAt(root, &.{ "rate_limits", "seven_day", "resets_at" });
     if (h5 != null or d7 != null) {
         try line.seg();
-        try quotaSeg(arena, io, line, h5, numAt(root, &.{ "rate_limits", "five_hour", "resets_at" }));
+        try quotaSeg(arena, io, line, h5, h5_reset);
         try line.color("33", " / ");
-        try quotaSeg(arena, io, line, d7, numAt(root, &.{ "rate_limits", "seven_day", "resets_at" }));
+        try quotaSeg(arena, io, line, d7, d7_reset);
+    }
+
+    // The weekly allowance does not roll over, so pace matters as much as level
+    // - and pace needs a history this payload does not carry. Log the sample.
+    if (cfg.quota_log) {
+        quota_mod.record(arena, io, quotaDir(arena, env), .{
+            .now = cache.nowSeconds(io),
+            .h5_pct = roundOr(h5),
+            .h5_reset = roundOr(h5_reset),
+            .d7_pct = roundOr(d7),
+            .d7_reset = roundOr(d7_reset),
+        }, cfg.quota_interval_s);
     }
 
     // --- context window ---
@@ -403,6 +435,22 @@ fn localHhMm(arena: std.mem.Allocator, io: Io) ![]const u8 {
 /// failing, since a missing cache only costs a git call.
 fn tmpDir(env: *std.process.Environ.Map) []const u8 {
     return env.get("TEMP") orelse env.get("TMPDIR") orelse ".";
+}
+
+/// Where the quota log lives. Unlike the caches in `tmpDir`, this is history
+/// that has to survive a temp sweep, so it goes beside hoot's database rather
+/// than in TEMP. GAZE_QUOTA_DIR overrides it, which is also how the tests keep
+/// off the real one.
+fn quotaDir(arena: std.mem.Allocator, env: *std.process.Environ.Map) []const u8 {
+    if (env.get("GAZE_QUOTA_DIR")) |d| return d;
+    const base = env.get("LOCALAPPDATA") orelse env.get("XDG_STATE_HOME") orelse env.get("HOME") orelse return ".";
+    return std.fmt.allocPrint(arena, "{s}{c}gaze", .{ base, std.fs.path.sep }) catch ".";
+}
+
+/// A payload number as a whole integer, or `quota_mod.absent` when it is missing.
+fn roundOr(v: ?f64) i64 {
+    const n = v orelse return quota_mod.absent;
+    return @intFromFloat(@round(n));
 }
 
 // ------------------------------------------------------------ small helpers

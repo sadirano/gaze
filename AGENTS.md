@@ -38,6 +38,7 @@ If you need a new segment that requires spawning something, put it behind
 | `src/dirty.zig` | the `git status` call, behind the cache |
 | `src/hoot.zig` | the `hoot count` call, behind the cache |
 | `src/cache.zig` | `<unix seconds> <value>` one-line cache in the temp dir |
+| `src/quota.zig` | appends the 5h/7d samples to a durable log, deduped |
 
 ## Build and test
 
