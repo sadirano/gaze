@@ -502,6 +502,15 @@ fn numAt(root: std.json.Value, path: []const []const u8) ?f64 {
 
 // ------------------------------------------------------------------- tests
 
+// Pull the modules' own tests into `zig build test`: a file's tests only run
+// when something in the test root references it, so until this block only
+// main.zig's ran and the quota dedupe rule went untested by the gate.
+test {
+    _ = cache;
+    _ = git;
+    _ = quota_mod;
+}
+
 test "relativeToAlias strips the root" {
     try std.testing.expectEqualStrings("src\\core", relativeToAlias("C:\\proj\\owl\\src\\core", "C:\\proj\\owl").?);
     try std.testing.expectEqualStrings("", relativeToAlias("C:\\proj\\owl", "C:\\proj\\owl").?);
