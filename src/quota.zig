@@ -8,9 +8,11 @@
 //! that does not roll over, that second question is the one with money in it.
 //!
 //! So each render appends a sample to a durable log. Writes are deduped through
-//! a one-line state file: a sample lands only when the seven-day percentage has
-//! moved or `min_interval_s` has elapsed, so an idle redraw loop writes nothing
-//! and a busy one writes at most one line per percentage point.
+//! a one-line state file: a sample lands only when the five-hour or seven-day
+//! percentage has moved or `min_interval_s` has elapsed, so an idle redraw loop
+//! writes nothing and a busy one writes at most one line per percentage point.
+//! Both windows count: the five-hour one is usually the binding limit, and
+//! watching only the seven-day number let it drift for minutes unlogged.
 //!
 //! Per gaze's one invariant, every failure here is silent. A log that cannot be
 //! written costs a gap in history; it must never cost a status line.
@@ -40,20 +42,23 @@ pub fn formatLine(buf: []u8, s: Sample) ![]const u8 {
 
 /// The dedupe rule, split from disk so it is testable.
 ///
-/// `state` is the previous state file's contents (`<unix seconds> <7d pct>`),
-/// or null when there is none. Unparseable state is treated as no state: the
-/// cost of one redundant sample is nothing, and the cost of a missing one is a
-/// gap nobody can reconstruct.
+/// `state` is the previous state file's contents
+/// (`<unix seconds> <7d pct> <5h pct>`), or null when there is none.
+/// Unparseable state is treated as no state: the cost of one redundant sample
+/// is nothing, and the cost of a missing one is a gap nobody can reconstruct.
+/// That includes a two-field state written before the five-hour field existed,
+/// which resyncs with one write.
 pub fn shouldWrite(state: ?[]const u8, s: Sample, min_interval_s: i64) bool {
     const content = state orelse return true;
-    const trimmed = std.mem.trim(u8, content, " \t\r\n");
-    const space = std.mem.indexOfScalar(u8, trimmed, ' ') orelse return true;
+    var fields = std.mem.tokenizeAny(u8, content, " \t\r\n");
 
-    const ts = std.fmt.parseInt(i64, trimmed[0..space], 10) catch return true;
-    const pct = std.fmt.parseInt(i64, trimmed[space + 1 ..], 10) catch return true;
+    const ts = std.fmt.parseInt(i64, fields.next() orelse return true, 10) catch return true;
+    const d7 = std.fmt.parseInt(i64, fields.next() orelse return true, 10) catch return true;
+    const h5 = std.fmt.parseInt(i64, fields.next() orelse return true, 10) catch return true;
 
-    // A moved percentage is the event worth recording, so never suppress it.
-    if (pct != s.d7_pct) return true;
+    // A moved percentage is the event worth recording, in either window, so
+    // never suppress it.
+    if (d7 != s.d7_pct or h5 != s.h5_pct) return true;
 
     const age = s.now - ts;
     // A negative age means the clock moved backwards. Write, so the log resyncs
@@ -93,7 +98,7 @@ pub fn record(
     // State last: if this fails the next render simply re-samples, which is a
     // duplicate line rather than a lost one.
     var state_buf: [64]u8 = undefined;
-    const state_line = std.fmt.bufPrint(&state_buf, "{d} {d}", .{ s.now, s.d7_pct }) catch return;
+    const state_line = std.fmt.bufPrint(&state_buf, "{d} {d} {d}", .{ s.now, s.d7_pct, s.h5_pct }) catch return;
     Io.Dir.cwd().writeFile(io, .{ .sub_path = state_path, .data = state_line }) catch {};
 }
 
@@ -120,22 +125,33 @@ test "shouldWrite records the first sample" {
     try std.testing.expect(shouldWrite(null, .{ .now = 1000, .d7_pct = 10 }, 300));
 }
 
-test "shouldWrite records a moved percentage immediately" {
-    try std.testing.expect(shouldWrite("990 9", .{ .now = 1000, .d7_pct = 10 }, 300));
+test "shouldWrite records a moved seven-day percentage immediately" {
+    try std.testing.expect(shouldWrite("990 9 50", .{ .now = 1000, .d7_pct = 10, .h5_pct = 50 }, 300));
 }
 
-test "shouldWrite suppresses an unchanged percentage inside the interval" {
-    try std.testing.expect(!shouldWrite("990 10", .{ .now = 1000, .d7_pct = 10 }, 300));
+test "shouldWrite records a moved five-hour percentage immediately" {
+    // the case that went unlogged for minutes: 5h moves while 7d holds still
+    try std.testing.expect(shouldWrite("990 10 50", .{ .now = 1000, .d7_pct = 10, .h5_pct = 51 }, 300));
+    // a five-hour reset reports the percentage as absent, which is a move too
+    try std.testing.expect(shouldWrite("990 10 50", .{ .now = 1000, .d7_pct = 10, .h5_pct = absent }, 300));
 }
 
-test "shouldWrite records an unchanged percentage past the interval" {
-    try std.testing.expect(shouldWrite("700 10", .{ .now = 1000, .d7_pct = 10 }, 300));
+test "shouldWrite suppresses unchanged percentages inside the interval" {
+    try std.testing.expect(!shouldWrite("990 10 50", .{ .now = 1000, .d7_pct = 10, .h5_pct = 50 }, 300));
+}
+
+test "shouldWrite records unchanged percentages past the interval" {
+    try std.testing.expect(shouldWrite("600 10 50", .{ .now = 1000, .d7_pct = 10, .h5_pct = 50 }, 300));
     // The boundary itself counts as elapsed.
-    try std.testing.expect(shouldWrite("700 10", .{ .now = 1000, .d7_pct = 10 }, 300));
+    try std.testing.expect(shouldWrite("700 10 50", .{ .now = 1000, .d7_pct = 10, .h5_pct = 50 }, 300));
 }
 
 test "shouldWrite treats a backwards clock as due" {
-    try std.testing.expect(shouldWrite("2000 10", .{ .now = 1000, .d7_pct = 10 }, 300));
+    try std.testing.expect(shouldWrite("2000 10 50", .{ .now = 1000, .d7_pct = 10, .h5_pct = 50 }, 300));
+}
+
+test "shouldWrite resyncs once from a state file without the five-hour field" {
+    try std.testing.expect(shouldWrite("990 10", .{ .now = 1000, .d7_pct = 10, .h5_pct = 50 }, 300));
 }
 
 test "shouldWrite treats unparseable state as no state" {
@@ -143,4 +159,5 @@ test "shouldWrite treats unparseable state as no state" {
     try std.testing.expect(shouldWrite("", .{ .now = 1000, .d7_pct = 10 }, 300));
     try std.testing.expect(shouldWrite("1000", .{ .now = 1000, .d7_pct = 10 }, 300));
     try std.testing.expect(shouldWrite("abc def", .{ .now = 1000, .d7_pct = 10 }, 300));
+    try std.testing.expect(shouldWrite("1000 10 x", .{ .now = 1000, .d7_pct = 10 }, 300));
 }
