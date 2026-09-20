@@ -34,8 +34,8 @@ Left to right, each one absent when its data is missing or zero:
   reset, red past 80%. Claude Code sends those two; Antigravity sends its own
   buckets and they render the same way. All of them are also appended to a quota
   log; see below.
-- **`agy 27%` / `codex ~98%`** - what the OTHER tools have left, so free quota
-  elsewhere is a glance rather than a question. See below.
+- **`Ag33% X98%`** - what the OTHER tools have left, one letter each, so free
+  quota elsewhere is a glance rather than a question. See below.
 - **`#n%`** - context window used.
 - **`@n`** - cached context tokens (`cache_read + cache_creation`), k/M suffixed.
 - **`$n`** - session cost, hidden below half a cent so a fresh session shows
@@ -144,8 +144,14 @@ Every source writes `quota-<source>.log`, so the tools' levels already sit on
 disk next to each other. gaze renders the ones this session is not:
 
 ```
-(gaze) src > Opus 5  main clean  44% @3h48m / 51% @140h38m  agy 27%  codex 98%  15:21
+(gaze) src > Opus 5  main clean  61% @3h6m / 53% @139h56m  Ag33% X98%  16:03
 ```
+
+`C` is Claude Code, `A` Antigravity, `X` CodeX. A tool metering several
+independent allowances reports its **emptiest** one and names it: `Ag33%` is
+Antigravity's Gemini tier, `Ac` its third-party one. Reporting the fullest would
+send work away from a tool with a free window, which is the whole point of
+showing it.
 
 One tail read per peer, no spawn. Two honesty rules, because showing a stale
 number as a current one is the failure this project refuses:

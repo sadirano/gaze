@@ -46,11 +46,16 @@ const usage =
     \\intervals and name; flags win.
     \\
     \\Every OTHER source's level is shown too, read from its own log - so free
-    \\quota somewhere else is a glance rather than a question. A window past its
-    \\reset reads as 0% without asking anyone; a sample older than 30 minutes is
-    \\marked `~`. Codex is nobody's status line, so its log is kept current from
-    \\the rate_limits its own session transcripts already carry - a file read,
-    \\never a request. `gaze codex-quota` is the authoritative on-demand refresh.
+    \\quota somewhere else is a glance rather than a question. One letter each:
+    \\C for Claude Code, A for Antigravity, X for CodeX. A tool metering several
+    \\independent allowances reports its emptiest one and names it - `Ag33%` is
+    \\Antigravity's Gemini tier, `Ac` its third-party one - so the number says
+    \\which model setting would actually receive the work.
+    \\
+    \\A window past its reset reads as 0% without asking anyone; a sample older
+    \\than 30 minutes is marked `~`. Codex is nobody's status line, so its log is
+    \\kept current from the rate_limits its own session transcripts already carry
+    \\- a file read, never a request. `gaze codex-quota` refreshes it for real.
     \\
     \\The quota percentages are also appended to <GAZE_QUOTA_DIR, or
     \\%LOCALAPPDATA%\gaze>\quota-<source>.log, one line per change, so that pace
@@ -61,7 +66,7 @@ const usage =
     \\rate_limits, "agy" for Antigravity's quota buckets - so two tools sharing
     \\one gaze never interleave, and `ls quota-*.log` says which have reported.
     \\A line is a unix timestamp plus one `<window>=<used pct>@<reset unix>`
-    \\field per allowance window, in the payload's own order:
+    \\field per allowance window:
     \\
     \\    1789924544 <tab> 5h=4@1789942200 <tab> 7d=47@1790434800
     \\
@@ -340,12 +345,20 @@ fn render(
     const now = cache.nowSeconds(io);
     var win_buf: [quota_mod.max_windows]quota_mod.Window = undefined;
     const q = collectQuota(root, &win_buf, now);
-    if (q.windows.len > 0) {
-        try line.seg();
-        for (q.windows, 0..) |w, i| {
-            if (i > 0) try line.color("33", " / ");
-            try quotaSeg(arena, line, now, w);
+    // One segment per allowance, labelled when there is more than one to tell
+    // apart. Antigravity meters a Claude model and a Gemini model separately, so
+    // a bare row of four percentages would say nothing about which is which.
+    var group: ?[]const u8 = null;
+    for (q.windows) |w| {
+        const g = quota_mod.groupOf(w.name);
+        if (group == null or !std.mem.eql(u8, g, group.?)) {
+            try line.seg();
+            if (g.len > 0) try line.color("90", try std.fmt.allocPrint(arena, "{s} ", .{g}));
+        } else {
+            try line.color("33", " / ");
         }
+        try quotaSeg(arena, line, now, w);
+        group = g;
     }
 
     // The weekly allowance does not roll over, so pace matters as much as level
@@ -370,15 +383,21 @@ fn render(
                 codex_peek.refresh(arena, io, home, quota_dir, tmpDir(env), cfg.codex_ttl_s, now);
             }
         }
+        // One segment for all of them, single letters, joined tight: this shares
+        // a line with everything else and is meant to be glanced at, not read.
+        var shown = false;
         for (peers_mod.known) |peer| {
-            if (std.mem.eql(u8, peer, source)) continue;
-            const level = peers_mod.read(arena, io, quota_dir, peer, now) orelse continue;
-            try line.seg();
-            try line.color("90", try std.fmt.allocPrint(arena, "{s} {s}{d}%", .{
-                peer,
+            if (std.mem.eql(u8, peer.source, source)) continue;
+            const level = peers_mod.read(arena, io, quota_dir, peer.source, now) orelse continue;
+            if (!shown) try line.seg();
+            try line.color("90", try std.fmt.allocPrint(arena, "{s}{s}{s}{s}{d}%", .{
+                if (shown) " " else "",
+                peer.tag,
+                peers_mod.groupTag(level.group),
                 if (level.stale) "~" else "",
                 level.pct,
             }));
+            shown = true;
         }
     }
 
@@ -491,7 +510,18 @@ fn collectQuota(root: std.json.Value, buf: []quota_mod.Window, now: i64) Quota {
                 };
                 n += 1;
             }
-            if (n > 0) return .{ .source = "agy", .windows = buf[0..n] };
+            if (n > 0) {
+                // The payload is a map, so its order is whatever the tool
+                // happened to serialize. Sorting by name groups an allowance's
+                // windows together for the renderer and keeps the log's field
+                // order stable between samples.
+                std.mem.sort(quota_mod.Window, buf[0..n], {}, struct {
+                    fn less(_: void, x: quota_mod.Window, y: quota_mod.Window) bool {
+                        return std.mem.lessThan(u8, x.name, y.name);
+                    }
+                }.less);
+                return .{ .source = "agy", .windows = buf[0..n] };
+            }
         }
     }
 

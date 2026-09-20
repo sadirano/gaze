@@ -17,9 +17,45 @@ const std = @import("std");
 const Io = std.Io;
 const quota = @import("quota.zig");
 
-/// Every source gaze knows how to file a sample under. Small and fixed: probing
-/// three paths costs less than listing the directory to discover them.
-pub const known = [_][]const u8{ "claude", "agy", "codex" };
+/// Every source gaze knows how to file a sample under, with the single letter it
+/// renders as. Small and fixed: probing three paths costs less than listing the
+/// directory to discover them.
+///
+/// The letters exist because this segment is a glance, not a report - it shares
+/// a line with everything else and has to stay out of the way. `X` is for
+/// CodeX, since `C` belongs to Claude.
+pub const Peer = struct {
+    source: []const u8,
+    tag: []const u8,
+};
+
+pub const known = [_]Peer{
+    .{ .source = "claude", .tag = "C" },
+    .{ .source = "agy", .tag = "A" },
+    .{ .source = "codex", .tag = "X" },
+};
+
+/// The letter for an allowance within a peer, so `A` becomes `Ag` or `Ac`.
+///
+/// Antigravity's bucket ids name a billing tier rather than a model, so `3p`
+/// (third party) is the one you reach by setting a Claude model - which is why
+/// it renders `c` and not `3`. Anything unrecognised falls back to its first
+/// letter, which keeps a new bucket readable without a code change.
+pub fn groupTag(group: []const u8) []const u8 {
+    if (group.len == 0) return "";
+    if (std.mem.eql(u8, group, "gemini")) return "g";
+    if (std.mem.eql(u8, group, "3p")) return "c";
+    // Sliced out of a static string: returning the address of a local array
+    // would hand back a pointer to a dead stack frame.
+    const lower = "abcdefghijklmnopqrstuvwxyz";
+    for (group) |c| {
+        if (std.ascii.isAlphabetic(c)) {
+            const i = std.ascii.toLower(c) - 'a';
+            return lower[i .. i + 1];
+        }
+    }
+    return group[0..1];
+}
 
 /// Past this, a sample is marked rather than trusted. Half an hour is long
 /// enough that a quiet tool is not constantly flagged, short enough that a
@@ -30,10 +66,21 @@ pub const stale_after_s: i64 = 30 * 60;
 const tail_bytes = 512;
 
 pub const Level = struct {
-    /// Highest used percentage across the peer's windows - the binding one.
+    /// How used the peer's most available allowance is.
+    ///
+    /// Within one allowance every window binds, so the fullest of them is the
+    /// one that stops you: `5h=90 7d=10` means 90. Across INDEPENDENT
+    /// allowances they are alternatives, so the emptiest is what is actually
+    /// open: Antigravity at `3p-5h=100 gemini-5h=0` can still take work, and
+    /// reporting 100 there would send it away from a tool with a free window.
     pct: i64,
     /// Whether the sample is old enough that it should be shown as uncertain.
     stale: bool,
+    /// Which allowance `pct` belongs to, or "" when the peer meters only one.
+    ///
+    /// Naming it is the actionable half: "agy 33%" says work could go there,
+    /// "agy/gemini 33%" says which model setting would actually receive it.
+    group: []const u8,
 };
 
 /// The peer's current level from its log, or null when it has never reported.
@@ -70,7 +117,13 @@ pub fn parse(tail: []const u8, now: i64) ?Level {
 
     const ts = std.fmt.parseInt(i64, fields.next() orelse return null, 10) catch return null;
 
-    var best: ?i64 = null;
+    // Fullest window within an allowance, emptiest allowance across them.
+    var group: []const u8 = "";
+    var group_pct: ?i64 = null;
+    var open: ?i64 = null;
+    var open_group: []const u8 = "";
+    var groups: usize = 0;
+
     while (fields.next()) |f| {
         const eq = std.mem.indexOfScalar(u8, f, '=') orelse continue;
         const rest = f[eq + 1 ..];
@@ -84,12 +137,34 @@ pub fn parse(tail: []const u8, now: i64) ?Level {
             const reset = std.fmt.parseInt(i64, rest[a + 1 ..], 10) catch quota.absent;
             if (reset != quota.absent and now > reset) pct = 0;
         }
-        if (best == null or pct > best.?) best = pct;
+
+        const g = quota.groupOf(f[0..eq]);
+        if (group_pct != null and !std.mem.eql(u8, g, group)) {
+            if (open == null or group_pct.? < open.?) {
+                open = group_pct;
+                open_group = group;
+            }
+            groups += 1;
+            group_pct = null;
+        }
+        group = g;
+        if (group_pct == null or pct > group_pct.?) group_pct = pct;
+    }
+    if (group_pct) |last| {
+        if (open == null or last < open.?) {
+            open = last;
+            open_group = group;
+        }
+        groups += 1;
     }
 
-    const pct = best orelse return null;
+    const pct = open orelse return null;
     const age = now - ts;
-    return .{ .pct = pct, .stale = age < 0 or age > stale_after_s };
+    return .{
+        .pct = pct,
+        .stale = age < 0 or age > stale_after_s,
+        .group = if (groups > 1) open_group else "",
+    };
 }
 
 // ------------------------------------------------------------------- tests
@@ -98,6 +173,24 @@ test "parse takes the most used window as the binding one" {
     const l = parse("1000\t5h=4@9000\t7d=47@9000", 1100).?;
     try std.testing.expectEqual(@as(i64, 47), l.pct);
     try std.testing.expect(!l.stale);
+    try std.testing.expectEqualStrings("", l.group);
+}
+
+test "parse reports the emptiest allowance when a tool meters several" {
+    // Antigravity as measured on 2026-09-20: its Claude bucket is spent and its
+    // Gemini bucket is untouched. Reporting 100 would send work away from a tool
+    // with a completely free window.
+    const l = parse("1000\t3p-5h=100@9000\t3p-weekly=33@9000\tgemini-5h=0@9000\tgemini-weekly=33@9000", 1100).?;
+    try std.testing.expectEqual(@as(i64, 33), l.pct);
+    // Naming the open door is the point: it says which model setting takes work.
+    try std.testing.expectEqualStrings("gemini", l.group);
+}
+
+test "parse still binds on the fullest window inside one allowance" {
+    const l = parse("1000\t3p-5h=100@9000\t3p-weekly=20@9000", 1100).?;
+    try std.testing.expectEqual(@as(i64, 100), l.pct);
+    // One allowance metered two ways is not a choice between doors.
+    try std.testing.expectEqualStrings("", l.group);
 }
 
 test "parse reads the last line when the read began mid-line" {
@@ -129,4 +222,14 @@ test "parse ignores a window with no usable percentage" {
     try std.testing.expect(parse("1000\t5h=140", 1000) == null);
     try std.testing.expect(parse("1000", 1000) == null);
     try std.testing.expect(parse("", 1000) == null);
+}
+
+test "groupTag names the door in one letter" {
+    try std.testing.expectEqualStrings("g", groupTag("gemini"));
+    // `3p` is the tier you reach with a Claude model, so it reads as c, not 3.
+    try std.testing.expectEqualStrings("c", groupTag("3p"));
+    try std.testing.expectEqualStrings("", groupTag(""));
+    // An unknown bucket stays readable without anyone editing this table.
+    try std.testing.expectEqualStrings("o", groupTag("opus-tier"));
+    try std.testing.expectEqualStrings("p", groupTag("4pro"));
 }

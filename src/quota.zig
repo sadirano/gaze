@@ -125,6 +125,21 @@ pub fn writeName(buf: []u8, name: []const u8) ![]const u8 {
     return buf[0..src.len];
 }
 
+/// The allowance a window belongs to, or "" when it stands alone.
+///
+/// A tool can meter several INDEPENDENT allowances at once - Antigravity bills
+/// a Claude model against `3p-*` and a Gemini model against `gemini-*`, and
+/// emptying one leaves the other untouched. Those are not two views of one
+/// budget the way Claude Code's `5h` and `7d` are, so anything that reduces a
+/// tool to a single number has to know which windows bind together.
+///
+/// The convention is `<group>-<window>`: everything before the last `-`. A name
+/// without one, like `5h`, belongs to no group and is its own allowance.
+pub fn groupOf(name: []const u8) []const u8 {
+    const cut = std.mem.lastIndexOfScalar(u8, name, '-') orelse return "";
+    return name[0..cut];
+}
+
 /// The dedupe rule, split from disk so it is testable.
 ///
 /// `state` is the previous state file's contents (`<unix seconds>\t<key>`), or
@@ -321,4 +336,14 @@ test "shouldWrite treats unparseable state as no state" {
     try std.testing.expect(shouldWrite("garbage", 1000, "7d=10", 300));
     try std.testing.expect(shouldWrite("", 1000, "7d=10", 300));
     try std.testing.expect(shouldWrite("abc\t7d=10", 1000, "7d=10", 300));
+}
+
+test "groupOf splits a window off its allowance" {
+    try std.testing.expectEqualStrings("3p", groupOf("3p-5h"));
+    try std.testing.expectEqualStrings("gemini", groupOf("gemini-weekly"));
+    // Claude Code's two windows are one allowance, so they have no group.
+    try std.testing.expectEqualStrings("", groupOf("5h"));
+    try std.testing.expectEqualStrings("", groupOf("7d"));
+    // The LAST dash wins, so a hyphenated id keeps its tail as the window.
+    try std.testing.expectEqualStrings("gemini-3-pro", groupOf("gemini-3-pro-5h"));
 }
