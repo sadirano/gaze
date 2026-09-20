@@ -1,18 +1,28 @@
 //! Records the quota numbers the status line is already handed, so that pace can
-//! be computed from them later.
+//! be computed from them later - for whichever tool gaze is the status line of.
 //!
 //! Claude Code puts `rate_limits.{five_hour,seven_day}.{used_percentage,resets_at}`
-//! in every status line payload. gaze renders those two percentages and drops
-//! them. One sample answers "how much is left"; it cannot answer "am I on pace
-//! to finish the window at 100%", which needs a history - and for an allowance
-//! that does not roll over, that second question is the one with money in it.
+//! in every status line payload; Antigravity puts a map of arbitrarily named
+//! buckets. gaze renders those percentages and drops them. One sample answers
+//! "how much is left"; it cannot answer "am I on pace to finish the window at
+//! 100%", which needs a history - and for an allowance that does not roll over,
+//! that second question is the one with money in it.
 //!
-//! So each render appends a sample to a durable log. Writes are deduped through
-//! a one-line state file: a sample lands only when the five-hour or seven-day
-//! percentage has moved or `min_interval_s` has elapsed, so an idle redraw loop
-//! writes nothing and a busy one writes at most one line per percentage point.
-//! Both windows count: the five-hour one is usually the binding limit, and
-//! watching only the seven-day number let it drift for minutes unlogged.
+//! So each render appends a sample to a durable log. Two shapes had to survive
+//! that:
+//!
+//!   * The tools do not agree on how many windows there are or what they are
+//!     called. A line is therefore a timestamp plus one `<name>=<pct>@<reset>`
+//!     field per window, in the payload's own order - self-describing, variable
+//!     length, and no schema change when a tool adds a bucket.
+//!   * The tools must not interleave. Each source owns `quota-<source>.log`,
+//!     so `tail -1` answers "where is that tool right now" with no filtering,
+//!     and `ls quota-*.log` answers "which tools have ever reported".
+//!
+//! Writes are deduped through a per-source state file: a sample lands only when
+//! some window's percentage has moved or `min_interval_s` has elapsed, so an
+//! idle redraw loop writes nothing and a busy one writes at most one line per
+//! percentage point.
 //!
 //! Per gaze's one invariant, every failure here is silent. A log that cannot be
 //! written costs a gap in history; it must never cost a status line.
@@ -20,54 +30,125 @@
 const std = @import("std");
 const Io = std.Io;
 
-/// Absent values are recorded as -1 rather than omitted, so every line has the
-/// same shape and a reader never has to guess which field is missing.
+/// A percentage or timestamp that the payload did not carry. Absent windows are
+/// dropped from the line entirely rather than written as -1: with named fields,
+/// the absence of the name is already the signal, and a reader never has to
+/// decide whether -1 means "missing" or "impossible".
 pub const absent: i64 = -1;
+
+/// Enough for every window any one tool reports at once. Past this the extra
+/// buckets are dropped rather than the line being refused - a short sample beats
+/// no sample.
+pub const max_windows = 8;
+
+/// Window names come from the payload (Antigravity's are model or tier ids), so
+/// they are cut to something that cannot break a tab-separated line.
+pub const max_name_len = 32;
+
+/// One allowance window: Claude's five-hour and seven-day, or one of
+/// Antigravity's buckets.
+pub const Window = struct {
+    /// Short, stable, ASCII: `5h`, `7d`, or the bucket id.
+    name: []const u8,
+    /// Used percentage, 0-100. Antigravity reports what is left, so the caller
+    /// inverts; the log only ever holds "how much is gone".
+    pct: i64,
+    /// Unix seconds at which this window resets, or `absent`.
+    reset: i64 = absent,
+};
 
 pub const Sample = struct {
     now: i64,
-    h5_pct: i64 = absent,
-    h5_reset: i64 = absent,
-    d7_pct: i64 = absent,
-    d7_reset: i64 = absent,
+    /// Which tool this came from: the log file is named after it.
+    source: []const u8,
+    windows: []const Window,
 };
 
 /// Tab-separated so it stays greppable and parses with a split: ASCII only, one
 /// line per sample, newest appended at the end.
+///
+///     <unix seconds>\t<name>=<pct>@<reset>\t<name>=<pct>
+///
+/// The `@<reset>` half is omitted when the payload did not say, so a field is
+/// either `name=pct` or `name=pct@reset` and never carries a filler value.
 pub fn formatLine(buf: []u8, s: Sample) ![]const u8 {
-    return std.fmt.bufPrint(buf, "{d}\t{d}\t{d}\t{d}\t{d}\n", .{
-        s.now, s.h5_pct, s.h5_reset, s.d7_pct, s.d7_reset,
-    });
+    var n: usize = (try std.fmt.bufPrint(buf, "{d}", .{s.now})).len;
+    for (s.windows, 0..) |w, i| {
+        if (i >= max_windows) break;
+        if (w.pct == absent) continue;
+        buf[n] = '\t';
+        n += 1;
+        n += (try writeName(buf[n..], w.name)).len;
+        n += (try std.fmt.bufPrint(buf[n..], "={d}", .{w.pct})).len;
+        if (w.reset != absent) n += (try std.fmt.bufPrint(buf[n..], "@{d}", .{w.reset})).len;
+    }
+    if (n + 1 > buf.len) return error.NoSpaceLeft;
+    buf[n] = '\n';
+    return buf[0 .. n + 1];
+}
+
+/// The part of a sample that decides whether it is worth writing: the window
+/// names and their percentages, without the reset timestamps. Resets are
+/// absolute and would otherwise force a write every time one is re-stated.
+pub fn stateKey(buf: []u8, s: Sample) ![]const u8 {
+    var n: usize = 0;
+    for (s.windows, 0..) |w, i| {
+        if (i >= max_windows) break;
+        if (w.pct == absent) continue;
+        if (n > 0) {
+            buf[n] = ' ';
+            n += 1;
+        }
+        n += (try writeName(buf[n..], w.name)).len;
+        n += (try std.fmt.bufPrint(buf[n..], "={d}", .{w.pct})).len;
+    }
+    return buf[0..n];
+}
+
+/// A name reduced to `[A-Za-z0-9._-]` and cut to `max_name_len`. Anything else
+/// becomes `_`, so a bucket id with a tab, a space or a UTF-8 glyph in it can
+/// never split a field or leave non-ASCII in a log line.
+pub fn writeName(buf: []u8, name: []const u8) ![]const u8 {
+    const src = name[0..@min(name.len, max_name_len)];
+    if (src.len == 0) {
+        if (buf.len < 1) return error.NoSpaceLeft;
+        buf[0] = '_';
+        return buf[0..1];
+    }
+    if (buf.len < src.len) return error.NoSpaceLeft;
+    for (src, 0..) |c, i| {
+        buf[i] = switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '.', '_', '-' => c,
+            else => '_',
+        };
+    }
+    return buf[0..src.len];
 }
 
 /// The dedupe rule, split from disk so it is testable.
 ///
-/// `state` is the previous state file's contents
-/// (`<unix seconds> <7d pct> <5h pct>`), or null when there is none.
-/// Unparseable state is treated as no state: the cost of one redundant sample
-/// is nothing, and the cost of a missing one is a gap nobody can reconstruct.
-/// That includes a two-field state written before the five-hour field existed,
-/// which resyncs with one write.
-pub fn shouldWrite(state: ?[]const u8, s: Sample, min_interval_s: i64) bool {
+/// `state` is the previous state file's contents (`<unix seconds>\t<key>`), or
+/// null when there is none. Unparseable state is treated as no state: the cost
+/// of one redundant sample is nothing, and the cost of a missing one is a gap
+/// nobody can reconstruct. That includes the pre-source state file, which
+/// resyncs with one write.
+pub fn shouldWrite(state: ?[]const u8, now: i64, key: []const u8, min_interval_s: i64) bool {
     const content = state orelse return true;
-    var fields = std.mem.tokenizeAny(u8, content, " \t\r\n");
+    const tab = std.mem.indexOfScalar(u8, content, '\t') orelse return true;
+    const ts = std.fmt.parseInt(i64, std.mem.trim(u8, content[0..tab], " \r\n"), 10) catch return true;
 
-    const ts = std.fmt.parseInt(i64, fields.next() orelse return true, 10) catch return true;
-    const d7 = std.fmt.parseInt(i64, fields.next() orelse return true, 10) catch return true;
-    const h5 = std.fmt.parseInt(i64, fields.next() orelse return true, 10) catch return true;
+    // A moved percentage is the event worth recording, in any window, so never
+    // suppress it. A window appearing or disappearing moves the key too.
+    if (!std.mem.eql(u8, std.mem.trim(u8, content[tab + 1 ..], " \t\r\n"), key)) return true;
 
-    // A moved percentage is the event worth recording, in either window, so
-    // never suppress it.
-    if (d7 != s.d7_pct or h5 != s.h5_pct) return true;
-
-    const age = s.now - ts;
+    const age = now - ts;
     // A negative age means the clock moved backwards. Write, so the log resyncs
     // rather than going quiet until the old timestamp is overtaken.
     if (age < 0) return true;
     return age >= min_interval_s;
 }
 
-/// Append `s` to `<dir>/quota.log` unless the dedupe rule says otherwise.
+/// Append `s` to `<dir>/quota-<source>.log` unless the dedupe rule says otherwise.
 ///
 /// Silent on every failure, including a missing directory that cannot be
 /// created. Nothing here is allowed to reach the caller.
@@ -78,28 +159,53 @@ pub fn record(
     s: Sample,
     min_interval_s: i64,
 ) void {
-    // Nothing to record: a payload without the seven-day number is the one case
-    // where a sample would be pure noise.
-    if (s.d7_pct == absent) return;
+    var key_buf: [max_windows * (max_name_len + 8)]u8 = undefined;
+    const key = stateKey(&key_buf, s) catch return;
+    // Nothing to record: a payload with no usable window is the one case where a
+    // sample would be pure noise.
+    if (key.len == 0) return;
 
-    const log_path = std.fmt.allocPrint(arena, "{s}{c}quota.log", .{ dir, std.fs.path.sep }) catch return;
-    const state_path = std.fmt.allocPrint(arena, "{s}{c}quota.state", .{ dir, std.fs.path.sep }) catch return;
+    var src_buf: [max_name_len]u8 = undefined;
+    const src = writeName(&src_buf, s.source) catch return;
 
-    const state = Io.Dir.cwd().readFileAlloc(io, state_path, arena, .limited(128)) catch null;
-    if (!shouldWrite(state, s, min_interval_s)) return;
+    const log_path = std.fmt.allocPrint(arena, "{s}{c}quota-{s}.log", .{ dir, std.fs.path.sep, src }) catch return;
+    const state_path = std.fmt.allocPrint(arena, "{s}{c}quota-{s}.state", .{ dir, std.fs.path.sep, src }) catch return;
+
+    const state = Io.Dir.cwd().readFileAlloc(io, state_path, arena, .limited(512)) catch null;
+    if (!shouldWrite(state, s.now, key, min_interval_s)) return;
 
     // Only now is the directory worth creating - the common path touches nothing.
     Io.Dir.cwd().createDirPath(io, dir) catch {};
 
-    var line_buf: [128]u8 = undefined;
+    // No state means this is the first line this source has ever written, which
+    // is the one moment a pre-source log can still be sitting there unnamed.
+    if (state == null) retireUnsourcedLog(arena, io, dir);
+
+    var line_buf: [512]u8 = undefined;
     const line = formatLine(&line_buf, s) catch return;
     append(io, log_path, line) catch return;
 
     // State last: if this fails the next render simply re-samples, which is a
     // duplicate line rather than a lost one.
-    var state_buf: [64]u8 = undefined;
-    const state_line = std.fmt.bufPrint(&state_buf, "{d} {d} {d}", .{ s.now, s.d7_pct, s.h5_pct }) catch return;
+    var state_buf: [key_buf.len + 32]u8 = undefined;
+    const state_line = std.fmt.bufPrint(&state_buf, "{d}\t{s}", .{ s.now, key }) catch return;
     Io.Dir.cwd().writeFile(io, .{ .sub_path = state_path, .data = state_line }) catch {};
+}
+
+/// Move a log written before sources existed out of the way, once.
+///
+/// The old `quota.log` held Claude's five-hour and seven-day columns positionally
+/// and cannot be appended to in the new shape. It is history worth keeping, so it
+/// is renamed rather than deleted, and its stale state file is dropped so nothing
+/// reads a key out of it. Every step is best-effort: after the rename succeeds
+/// there is nothing left to find, and if it never succeeds the only cost is that
+/// the old file stays where it is.
+fn retireUnsourcedLog(arena: std.mem.Allocator, io: Io, dir: []const u8) void {
+    const old_log = std.fmt.allocPrint(arena, "{s}{c}quota.log", .{ dir, std.fs.path.sep }) catch return;
+    const new_log = std.fmt.allocPrint(arena, "{s}{c}quota-v1.log", .{ dir, std.fs.path.sep }) catch return;
+    const old_state = std.fmt.allocPrint(arena, "{s}{c}quota.state", .{ dir, std.fs.path.sep }) catch return;
+    Io.Dir.cwd().rename(old_log, Io.Dir.cwd(), new_log, io) catch return;
+    Io.Dir.cwd().deleteFile(io, old_state) catch {};
 }
 
 /// Append to a file, creating it when absent. `writeFile` truncates, so the
@@ -115,49 +221,104 @@ fn append(io: Io, path: []const u8, bytes: []const u8) !void {
 
 // ------------------------------------------------------------------- tests
 
-test "formatLine writes every field, absent as -1" {
-    var buf: [128]u8 = undefined;
-    const line = try formatLine(&buf, .{ .now = 1000, .d7_pct = 62, .d7_reset = 2000 });
-    try std.testing.expectEqualStrings("1000\t-1\t-1\t62\t2000\n", line);
+const claude_windows = [_]Window{
+    .{ .name = "5h", .pct = 4, .reset = 1789942200 },
+    .{ .name = "7d", .pct = 47, .reset = 1790434800 },
+};
+
+test "formatLine names every window and its reset" {
+    var buf: [512]u8 = undefined;
+    const line = try formatLine(&buf, .{ .now = 1000, .source = "claude", .windows = &claude_windows });
+    try std.testing.expectEqualStrings("1000\t5h=4@1789942200\t7d=47@1790434800\n", line);
+}
+
+test "formatLine omits the reset it was not given" {
+    var buf: [512]u8 = undefined;
+    const line = try formatLine(&buf, .{ .now = 1000, .source = "agy", .windows = &.{
+        .{ .name = "gemini-3-pro", .pct = 27 },
+    } });
+    try std.testing.expectEqualStrings("1000\tgemini-3-pro=27\n", line);
+}
+
+test "formatLine drops a window with no percentage" {
+    // A five-hour window that just reset reports nothing; the seven-day one
+    // still does, and the line is the shorter for it rather than absent.
+    var buf: [512]u8 = undefined;
+    const line = try formatLine(&buf, .{ .now = 1000, .source = "claude", .windows = &.{
+        .{ .name = "5h", .pct = absent, .reset = 1789942200 },
+        .{ .name = "7d", .pct = 47 },
+    } });
+    try std.testing.expectEqualStrings("1000\t7d=47\n", line);
+}
+
+test "formatLine keeps a line to the first max_windows buckets" {
+    var many: [max_windows + 3]Window = undefined;
+    for (&many, 0..) |*w, i| w.* = .{ .name = "b", .pct = @intCast(i) };
+    var buf: [512]u8 = undefined;
+    const line = try formatLine(&buf, .{ .now = 1, .source = "agy", .windows = &many });
+    try std.testing.expectEqual(@as(usize, max_windows), std.mem.count(u8, line, "\t"));
+}
+
+test "writeName keeps what is safe and replaces what is not" {
+    var buf: [max_name_len]u8 = undefined;
+    try std.testing.expectEqualStrings("gemini-3.0_pro", try writeName(&buf, "gemini-3.0_pro"));
+    try std.testing.expectEqualStrings("a_b_c", try writeName(&buf, "a b\tc"));
+    try std.testing.expectEqualStrings("_", try writeName(&buf, ""));
+}
+
+test "writeName cuts an over-long bucket id" {
+    var buf: [max_name_len]u8 = undefined;
+    const long = "x" ** (max_name_len + 10);
+    try std.testing.expectEqual(@as(usize, max_name_len), (try writeName(&buf, long)).len);
+}
+
+test "stateKey carries percentages but not resets" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("5h=4 7d=47", try stateKey(&buf, .{
+        .now = 1000,
+        .source = "claude",
+        .windows = &claude_windows,
+    }));
 }
 
 test "shouldWrite records the first sample" {
-    try std.testing.expect(shouldWrite(null, .{ .now = 1000, .d7_pct = 10 }, 300));
+    try std.testing.expect(shouldWrite(null, 1000, "7d=10", 300));
 }
 
-test "shouldWrite records a moved seven-day percentage immediately" {
-    try std.testing.expect(shouldWrite("990 9 50", .{ .now = 1000, .d7_pct = 10, .h5_pct = 50 }, 300));
-}
-
-test "shouldWrite records a moved five-hour percentage immediately" {
+test "shouldWrite records a moved percentage immediately" {
+    try std.testing.expect(shouldWrite("990\t5h=50 7d=9", 1000, "5h=50 7d=10", 300));
     // the case that went unlogged for minutes: 5h moves while 7d holds still
-    try std.testing.expect(shouldWrite("990 10 50", .{ .now = 1000, .d7_pct = 10, .h5_pct = 51 }, 300));
-    // a five-hour reset reports the percentage as absent, which is a move too
-    try std.testing.expect(shouldWrite("990 10 50", .{ .now = 1000, .d7_pct = 10, .h5_pct = absent }, 300));
+    try std.testing.expect(shouldWrite("990\t5h=50 7d=10", 1000, "5h=51 7d=10", 300));
+}
+
+test "shouldWrite records a window appearing or disappearing" {
+    // a five-hour reset reports the percentage as absent, which drops the field
+    try std.testing.expect(shouldWrite("990\t5h=50 7d=10", 1000, "7d=10", 300));
+    // a tool that added a bucket is a change worth a line
+    try std.testing.expect(shouldWrite("990\tfast=10", 1000, "fast=10 slow=0", 300));
 }
 
 test "shouldWrite suppresses unchanged percentages inside the interval" {
-    try std.testing.expect(!shouldWrite("990 10 50", .{ .now = 1000, .d7_pct = 10, .h5_pct = 50 }, 300));
+    try std.testing.expect(!shouldWrite("990\t5h=50 7d=10", 1000, "5h=50 7d=10", 300));
 }
 
 test "shouldWrite records unchanged percentages past the interval" {
-    try std.testing.expect(shouldWrite("600 10 50", .{ .now = 1000, .d7_pct = 10, .h5_pct = 50 }, 300));
+    try std.testing.expect(shouldWrite("600\t5h=50 7d=10", 1000, "5h=50 7d=10", 300));
     // The boundary itself counts as elapsed.
-    try std.testing.expect(shouldWrite("700 10 50", .{ .now = 1000, .d7_pct = 10, .h5_pct = 50 }, 300));
+    try std.testing.expect(shouldWrite("700\t5h=50 7d=10", 1000, "5h=50 7d=10", 300));
 }
 
 test "shouldWrite treats a backwards clock as due" {
-    try std.testing.expect(shouldWrite("2000 10 50", .{ .now = 1000, .d7_pct = 10, .h5_pct = 50 }, 300));
+    try std.testing.expect(shouldWrite("2000\t5h=50 7d=10", 1000, "5h=50 7d=10", 300));
 }
 
-test "shouldWrite resyncs once from a state file without the five-hour field" {
-    try std.testing.expect(shouldWrite("990 10", .{ .now = 1000, .d7_pct = 10, .h5_pct = 50 }, 300));
+test "shouldWrite resyncs once from the pre-source state file" {
+    // `<ts> <7d> <5h>`, space-separated, no key - unparseable is the point.
+    try std.testing.expect(shouldWrite("1789924544 47 4", 1000, "5h=4 7d=47", 300));
 }
 
 test "shouldWrite treats unparseable state as no state" {
-    try std.testing.expect(shouldWrite("garbage", .{ .now = 1000, .d7_pct = 10 }, 300));
-    try std.testing.expect(shouldWrite("", .{ .now = 1000, .d7_pct = 10 }, 300));
-    try std.testing.expect(shouldWrite("1000", .{ .now = 1000, .d7_pct = 10 }, 300));
-    try std.testing.expect(shouldWrite("abc def", .{ .now = 1000, .d7_pct = 10 }, 300));
-    try std.testing.expect(shouldWrite("1000 10 x", .{ .now = 1000, .d7_pct = 10 }, 300));
+    try std.testing.expect(shouldWrite("garbage", 1000, "7d=10", 300));
+    try std.testing.expect(shouldWrite("", 1000, "7d=10", 300));
+    try std.testing.expect(shouldWrite("abc\t7d=10", 1000, "7d=10", 300));
 }

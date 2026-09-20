@@ -30,8 +30,10 @@ Left to right, each one absent when its data is missing or zero:
 - **`branch clean|*dirty`** - see below.
 - **`🦉n`** - unseen hoot notifications; hidden when the inbox is empty or hoot
   is not installed.
-- **`5h% / 7d%`** - rate limit windows with time until reset, red past 80%. Both
-  are also appended to a quota log; see below.
+- **`5h% / 7d%`** - the allowance windows the payload carries, with time until
+  reset, red past 80%. Claude Code sends those two; Antigravity sends its own
+  buckets and they render the same way. All of them are also appended to a quota
+  log; see below.
 - **`#n%`** - context window used.
 - **`@n`** - cached context tokens (`cache_read + cache_creation`), k/M suffixed.
 - **`$n`** - session cost, hidden below half a cent so a fresh session shows
@@ -67,10 +69,13 @@ is a single short file, so it is always current and effectively free.
 --no-dirty              never check git; branch alone
 --no-hoot               never check hoot; drop the badge
 --no-quota-log          do not append quota samples to the log
+--source <name>         file quota samples under this tool's name instead of
+                        the one inferred from the payload
 -h, --help
 ```
 
-`GAZE_DIRTY_TTL` and `GAZE_HOOT_TTL` set the same intervals; flags win. Both
+`GAZE_DIRTY_TTL`, `GAZE_HOOT_TTL` and `GAZE_SOURCE` set the same three; flags
+win. Both
 `--dirty-ttl 5` and `--dirty-ttl=5` are accepted, the latter because it reads
 better inside a `settings.json` command string.
 
@@ -79,22 +84,54 @@ them cached, which is the point of the cache.
 
 ## The quota log
 
-The weekly allowance does not roll over, so pace matters as much as level - and
-the payload only ever carries the level. Each render therefore appends its
-sample to `%LOCALAPPDATA%\gaze\quota.log` (`GAZE_QUOTA_DIR` overrides the
-directory):
+An allowance that does not roll over makes pace matter as much as level - and the
+payload only ever carries the level. Each render therefore appends its sample to
+`%LOCALAPPDATA%\gaze\quota-<source>.log` (`GAZE_QUOTA_DIR` overrides the
+directory).
+
+`<source>` is the tool that sent the payload, so two tools sharing one gaze never
+interleave and `ls quota-*.log` says which have ever reported:
+
+| source | recognised by | windows |
+|---|---|---|
+| `claude` | `rate_limits.{five_hour,seven_day}` | `5h`, `7d` |
+| `agy` | a `quota` map of buckets | whatever the buckets are called |
+
+`--source <name>` (or `GAZE_SOURCE`) overrides the inferred name. A line is a
+unix timestamp followed by one field per allowance window, tab separated:
 
 ```
-<unix ts>  <5h pct>  <5h reset>  <7d pct>  <7d reset>
+1789924544      5h=4@1789942200 7d=47@1790434800
+1789925385      gemini-3-pro=27 fast=50@1789939785
 ```
 
-Tab separated, absent fields as `-1`. A line is written when the seven-day
-percentage moves, and otherwise at most once every five minutes, so an idle
-redraw loop writes nothing and a busy one writes about one line per point.
+Each field is `<window>=<used percent>` plus `@<reset unix>` when the payload
+said one. Windows keep the payload's own order, a window the payload did not
+report is simply absent, and the names are cut to 32 characters of
+`[A-Za-z0-9._-]` - so a bucket id can never split a field or put a non-ASCII
+byte in the log. Antigravity reports what is *left*; gaze inverts it, so the log
+only ever holds what is gone.
 
-This costs one 128-byte read on the common path and no process spawn. As with
-every other segment, failure is silent: an unwritable log costs a gap in the
-history and never a status line.
+`tail -1 quota-claude.log` is therefore the whole current picture for that tool,
+with no filtering.
+
+A line is written when any window's percentage moves, and otherwise at most once
+every five minutes, so an idle redraw loop writes nothing and a busy one writes
+about one line per point. Dedupe state lives per source in
+`quota-<source>.state`.
+
+This costs one small read on the common path and no process spawn. As with every
+other segment, failure is silent: an unwritable log costs a gap in the history
+and never a status line.
+
+`GAZE_DUMP_PAYLOAD=<path>` writes the raw stdin there on every render, which is
+how a new tool's field names get learned in the first place.
+
+**Upgrading:** the pre-source log had positional columns
+(`<ts> <5h pct> <5h reset> <7d pct> <7d reset>`) and cannot be appended to in
+this shape. The first write after the upgrade renames it to `quota-v1.log` and
+starts the per-source files fresh. Nothing is lost; old history just reads with
+the old rules.
 
 ## Install
 

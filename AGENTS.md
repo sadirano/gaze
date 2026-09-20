@@ -38,7 +38,7 @@ If you need a new segment that requires spawning something, put it behind
 | `src/dirty.zig` | the `git status` call, behind the cache |
 | `src/hoot.zig` | the `hoot count` call, behind the cache |
 | `src/cache.zig` | `<unix seconds> <value>` one-line cache in the temp dir |
-| `src/quota.zig` | appends the 5h/7d samples to a durable log, deduped |
+| `src/quota.zig` | appends each source's quota samples to its own durable log, deduped |
 
 ## Build and test
 
@@ -50,6 +50,27 @@ x gaze :demo      # render a sample payload to look at
 
 ReleaseFast is not a preference. A Debug build gives back most of the startup
 win that is the whole point.
+
+## More than one tool sends quota
+
+gaze is the status line for Claude Code and for Antigravity, and they disagree
+about quota: Claude names two fixed windows and reports what is SPENT,
+Antigravity hands a map of buckets it names itself and reports what is LEFT.
+
+`collectQuota` in `main.zig` is the only place that knows the difference. It
+reduces either shape to `{source, windows[]}`, inverts Antigravity's fraction,
+and anchors a `reset_in_seconds` countdown to an absolute timestamp - so the
+renderer and `quota.zig` only ever see "how much is gone, by when". A third tool
+is a third branch there and nothing else.
+
+Each source owns `quota-<source>.log`, which is what keeps two tools sharing one
+gaze from interleaving. Do not merge them back into one file: `tail -1` per
+source is the read that matters, and a source column would put a grep in front
+of every one of them.
+
+**A payload shape is not guessable from the outside.** Set `GAZE_DUMP_PAYLOAD`
+to a path and run one session of the tool: it writes the raw stdin there every
+render. Do that before writing a parser, not after.
 
 ## Changing the rendered line
 

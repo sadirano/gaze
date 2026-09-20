@@ -32,14 +32,27 @@ const usage =
     \\  --no-dirty             never check git; show the branch alone
     \\  --no-hoot              never check hoot; drop the badge
     \\  --no-quota-log         do not append quota samples to the log
+    \\  --source <name>        file the quota samples under this tool's name
+    \\                         instead of the one inferred from the payload
     \\  -h, --help             this text
     \\
-    \\GAZE_DIRTY_TTL and GAZE_HOOT_TTL set the same intervals; flags win.
+    \\GAZE_DIRTY_TTL, GAZE_HOOT_TTL and GAZE_SOURCE set the same three; flags win.
     \\
-    \\The 5h and 7d percentages are also appended to <GAZE_QUOTA_DIR, or
-    \\%LOCALAPPDATA%\gaze>\quota.log, one line per change, so that pace over the
-    \\week can be computed from them. A weekly allowance that does not roll over
-    \\needs the history; the payload only ever carries the current level.
+    \\The quota percentages are also appended to <GAZE_QUOTA_DIR, or
+    \\%LOCALAPPDATA%\gaze>\quota-<source>.log, one line per change, so that pace
+    \\can be computed from them. An allowance that does not roll over needs the
+    \\history; the payload only ever carries the current level.
+    \\
+    \\<source> is the tool that sent the payload - "claude" for Claude Code's
+    \\rate_limits, "agy" for Antigravity's quota buckets - so two tools sharing
+    \\one gaze never interleave, and `ls quota-*.log` says which have reported.
+    \\A line is a unix timestamp plus one `<window>=<used pct>@<reset unix>`
+    \\field per allowance window, in the payload's own order:
+    \\
+    \\    1789924544 <tab> 5h=4@1789942200 <tab> 7d=47@1790434800
+    \\
+    \\GAZE_DUMP_PAYLOAD, when set to a path, writes the raw stdin there on every
+    \\render - the way to learn a new tool's field names.
     \\
     \\Both of those answers cost a process spawn (~37ms and ~26ms), far more
     \\than everything else here put together, and neither changes anywhere near
@@ -66,6 +79,10 @@ const Config = struct {
     check_hoot: bool = true,
     quota_log: bool = true,
     quota_interval_s: i64 = default_quota_interval_s,
+    /// Which tool's log this render belongs in. Normally inferred from the
+    /// payload shape; set only when a tool sends a shape gaze already knows but
+    /// should not file under that tool's name.
+    source: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -90,6 +107,7 @@ pub fn main(init: std.process.Init) !void {
     // Read stdin whole. 256KB is far above any real payload; a larger one is
     // truncated rather than refused, since a clipped status line still beats none.
     const raw = readAllStdin(arena, io) catch "";
+    dumpPayload(io, init.environ_map, raw);
     if (raw.len == 0) {
         try out.writeAll("> ?\n");
         return;
@@ -117,6 +135,10 @@ fn parseArgs(
     // Env first so an explicit flag can override it.
     if (envTtl(env, "GAZE_DIRTY_TTL")) |n| cfg.dirty_ttl_s = n;
     if (envTtl(env, "GAZE_HOOT_TTL")) |n| cfg.hoot_ttl_s = n;
+    if (env.get("GAZE_SOURCE")) |s| {
+        const t = std.mem.trim(u8, s, " \t");
+        if (t.len > 0) cfg.source = t;
+    }
     _ = arena;
 
     var i: usize = 0;
@@ -143,6 +165,10 @@ fn parseArgs(
             cfg.hoot_ttl_s = n;
             continue;
         }
+        if (try valueFlag(args, &i, "--source")) |s| {
+            cfg.source = s;
+            continue;
+        }
         return error.UnknownFlag;
     }
     return cfg;
@@ -156,14 +182,22 @@ fn envTtl(env: *std.process.Environ.Map, name: []const u8) ?u32 {
 /// Accepts both `--flag 5` and `--flag=5`; the latter is what reads cleanly
 /// inside a settings.json command string, where quoting separate words is fiddly.
 fn ttlFlag(args: []const [:0]const u8, i: *usize, name: []const u8) !?u32 {
+    const v = try valueFlag(args, i, name) orelse return null;
+    return try std.fmt.parseInt(u32, v, 10);
+}
+
+/// The `--flag value` / `--flag=value` pair, as text. Same two spellings as
+/// `ttlFlag`, for the same reason: `=` is what reads cleanly inside a
+/// settings.json command string.
+fn valueFlag(args: []const [:0]const u8, i: *usize, name: []const u8) !?[]const u8 {
     const a = args[i.*];
     if (std.mem.eql(u8, a, name)) {
         i.* += 1;
         if (i.* >= args.len) return error.MissingValue;
-        return try std.fmt.parseInt(u32, args[i.*], 10);
+        return args[i.*];
     }
     if (a.len > name.len and std.mem.startsWith(u8, a, name) and a[name.len] == '=') {
-        return try std.fmt.parseInt(u32, a[name.len + 1 ..], 10);
+        return a[name.len + 1 ..];
     }
     return null;
 }
@@ -267,27 +301,25 @@ fn render(
         }
     }
 
-    // --- quota: 5h / 7d, red past 80% ---
-    const h5 = numAt(root, &.{ "rate_limits", "five_hour", "used_percentage" });
-    const d7 = numAt(root, &.{ "rate_limits", "seven_day", "used_percentage" });
-    const h5_reset = numAt(root, &.{ "rate_limits", "five_hour", "resets_at" });
-    const d7_reset = numAt(root, &.{ "rate_limits", "seven_day", "resets_at" });
-    if (h5 != null or d7 != null) {
+    // --- quota: every allowance window the payload carries, red past 80% ---
+    const now = cache.nowSeconds(io);
+    var win_buf: [quota_mod.max_windows]quota_mod.Window = undefined;
+    const q = collectQuota(root, &win_buf, now);
+    if (q.windows.len > 0) {
         try line.seg();
-        try quotaSeg(arena, io, line, h5, h5_reset);
-        try line.color("33", " / ");
-        try quotaSeg(arena, io, line, d7, d7_reset);
+        for (q.windows, 0..) |w, i| {
+            if (i > 0) try line.color("33", " / ");
+            try quotaSeg(arena, line, now, w);
+        }
     }
 
     // The weekly allowance does not roll over, so pace matters as much as level
     // - and pace needs a history this payload does not carry. Log the sample.
     if (cfg.quota_log) {
         quota_mod.record(arena, io, quotaDir(arena, env), .{
-            .now = cache.nowSeconds(io),
-            .h5_pct = roundOr(h5),
-            .h5_reset = roundOr(h5_reset),
-            .d7_pct = roundOr(d7),
-            .d7_reset = roundOr(d7_reset),
+            .now = now,
+            .source = cfg.source orelse q.source,
+            .windows = q.windows,
         }, cfg.quota_interval_s);
     }
 
@@ -337,12 +369,76 @@ fn render(
     try line.color("90", try localHhMm(arena, io));
 }
 
-fn quotaSeg(arena: std.mem.Allocator, io: Io, line: *Line, pct: ?f64, resets_at: ?f64) !void {
-    const p = pct orelse 0;
+/// What the payload said about quota, reduced to the one shape the renderer and
+/// the log both work in.
+const Quota = struct {
+    /// Which tool sent it. Names the log file, so it stays short and ASCII.
+    source: []const u8,
+    windows: []const quota_mod.Window,
+};
+
+/// Reads whichever quota shape the payload carries.
+///
+/// Claude Code names two fixed windows and reports what is SPENT. Antigravity
+/// hands a map of buckets it names itself and reports what is LEFT, so the
+/// fraction is inverted here - everything downstream only ever sees "how much
+/// is gone", which is what makes one log format serve both.
+///
+/// A Claude window whose percentage is missing is still returned, so that a lone
+/// number is never mistaken for the other window; `quota_mod` drops it from the
+/// log, where an omitted field is already the signal.
+fn collectQuota(root: std.json.Value, buf: []quota_mod.Window, now: i64) Quota {
+    const h5 = numAt(root, &.{ "rate_limits", "five_hour", "used_percentage" });
+    const d7 = numAt(root, &.{ "rate_limits", "seven_day", "used_percentage" });
+    if (h5 != null or d7 != null) {
+        buf[0] = .{
+            .name = "5h",
+            .pct = roundOr(h5),
+            .reset = roundOr(numAt(root, &.{ "rate_limits", "five_hour", "resets_at" })),
+        };
+        buf[1] = .{
+            .name = "7d",
+            .pct = roundOr(d7),
+            .reset = roundOr(numAt(root, &.{ "rate_limits", "seven_day", "resets_at" })),
+        };
+        return .{ .source = "claude", .windows = buf[0..2] };
+    }
+
+    if (at(root, &.{"quota"})) |v| {
+        if (v == .object) {
+            var n: usize = 0;
+            var it = v.object.iterator();
+            while (it.next()) |e| {
+                if (n >= buf.len) break;
+                const remaining = numAt(e.value_ptr.*, &.{"remaining_fraction"}) orelse continue;
+                var reset = roundOr(numAt(e.value_ptr.*, &.{"reset_time"}));
+                // A countdown is as good as a timestamp once it is anchored, and
+                // the log only ever stores the absolute form.
+                if (reset == quota_mod.absent) {
+                    if (numAt(e.value_ptr.*, &.{"reset_in_seconds"})) |s| {
+                        reset = now + @as(i64, @intFromFloat(@round(s)));
+                    }
+                }
+                buf[n] = .{
+                    .name = e.key_ptr.*,
+                    .pct = @intFromFloat(@round((1.0 - remaining) * 100.0)),
+                    .reset = reset,
+                };
+                n += 1;
+            }
+            if (n > 0) return .{ .source = "agy", .windows = buf[0..n] };
+        }
+    }
+
+    return .{ .source = "claude", .windows = &.{} };
+}
+
+fn quotaSeg(arena: std.mem.Allocator, line: *Line, now: i64, w: quota_mod.Window) !void {
+    const p = if (w.pct == quota_mod.absent) 0 else w.pct;
     const code: []const u8 = if (p > 80) "31" else "33";
-    try line.color(code, try std.fmt.allocPrint(arena, "{d}%", .{@as(i64, @intFromFloat(p))}));
-    if (resets_at) |r| {
-        if (timeLeft(arena, cache.nowSeconds(io), @intFromFloat(r))) |t| {
+    try line.color(code, try std.fmt.allocPrint(arena, "{d}%", .{p}));
+    if (w.reset != quota_mod.absent) {
+        if (timeLeft(arena, now, w.reset)) |t| {
             try line.color("90", try std.fmt.allocPrint(arena, " {s}", .{t}));
         }
     }
@@ -435,6 +531,18 @@ fn localHhMm(arena: std.mem.Allocator, io: Io) ![]const u8 {
 /// failing, since a missing cache only costs a git call.
 fn tmpDir(env: *std.process.Environ.Map) []const u8 {
     return env.get("TEMP") orelse env.get("TMPDIR") orelse ".";
+}
+
+/// Write the raw payload to `GAZE_DUMP_PAYLOAD` when it is set, overwriting.
+///
+/// The field names a tool actually sends are the one thing that cannot be
+/// guessed from the outside, and wrapping the status line command in a shell to
+/// tee its stdin is fiddly enough to get wrong. Opt-in, one small write, silent
+/// on failure like everything else here.
+fn dumpPayload(io: Io, env: *std.process.Environ.Map, raw: []const u8) void {
+    const path = env.get("GAZE_DUMP_PAYLOAD") orelse return;
+    if (path.len == 0) return;
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = raw }) catch {};
 }
 
 /// Where the quota log lives. Unlike the caches in `tmpDir`, this is history
@@ -551,4 +659,81 @@ test "formatDuration picks the coarsest useful unit" {
     try std.testing.expectEqualStrings("8s", try formatDuration(g, 8200));
     try std.testing.expectEqualStrings("47m", try formatDuration(g, 2_820_000));
     try std.testing.expectEqualStrings("1h15m", try formatDuration(g, 4_530_000));
+}
+
+/// Parse a payload the way `main` does, for the collector tests.
+fn testQuota(
+    arena: std.mem.Allocator,
+    json: []const u8,
+    buf: []quota_mod.Window,
+    now: i64,
+) !Quota {
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, json, .{});
+    return collectQuota(parsed.value, buf, now);
+}
+
+test "collectQuota reads Claude's two named windows" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    var buf: [quota_mod.max_windows]quota_mod.Window = undefined;
+    const q = try testQuota(a.allocator(), "{\"rate_limits\":{\"five_hour\":{\"used_percentage\":4.2,\"resets_at\":1789942200},\"seven_day\":{\"used_percentage\":47.0,\"resets_at\":1790434800}}}", &buf, 1789924544);
+    try std.testing.expectEqualStrings("claude", q.source);
+    try std.testing.expectEqual(@as(usize, 2), q.windows.len);
+    try std.testing.expectEqualStrings("5h", q.windows[0].name);
+    try std.testing.expectEqual(@as(i64, 4), q.windows[0].pct);
+    try std.testing.expectEqual(@as(i64, 1789942200), q.windows[0].reset);
+    try std.testing.expectEqualStrings("7d", q.windows[1].name);
+    try std.testing.expectEqual(@as(i64, 47), q.windows[1].pct);
+}
+
+test "collectQuota keeps a missing Claude window so one number is not read as the other" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    var buf: [quota_mod.max_windows]quota_mod.Window = undefined;
+    const q = try testQuota(a.allocator(), "{\"rate_limits\":{\"seven_day\":{\"used_percentage\":47.0}}}", &buf, 1789924544);
+    try std.testing.expectEqual(@as(usize, 2), q.windows.len);
+    try std.testing.expectEqual(quota_mod.absent, q.windows[0].pct);
+    try std.testing.expectEqual(@as(i64, 47), q.windows[1].pct);
+}
+
+test "collectQuota inverts Antigravity's remaining fraction" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    var buf: [quota_mod.max_windows]quota_mod.Window = undefined;
+    const q = try testQuota(a.allocator(), "{\"quota\":{\"gemini-3-pro\":{\"remaining_fraction\":0.73,\"reset_time\":1790000000}}}", &buf, 1789924544);
+    try std.testing.expectEqualStrings("agy", q.source);
+    try std.testing.expectEqual(@as(usize, 1), q.windows.len);
+    try std.testing.expectEqualStrings("gemini-3-pro", q.windows[0].name);
+    // 0.73 left is 27 spent - the log only ever holds what is gone.
+    try std.testing.expectEqual(@as(i64, 27), q.windows[0].pct);
+    try std.testing.expectEqual(@as(i64, 1790000000), q.windows[0].reset);
+}
+
+test "collectQuota anchors a countdown to now" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    var buf: [quota_mod.max_windows]quota_mod.Window = undefined;
+    const q = try testQuota(a.allocator(), "{\"quota\":{\"fast\":{\"remaining_fraction\":0.5,\"reset_in_seconds\":14400}}}", &buf, 1000);
+    try std.testing.expectEqual(@as(i64, 50), q.windows[0].pct);
+    try std.testing.expectEqual(@as(i64, 15400), q.windows[0].reset);
+}
+
+test "collectQuota skips a bucket that says nothing about what is left" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    var buf: [quota_mod.max_windows]quota_mod.Window = undefined;
+    const q = try testQuota(a.allocator(), "{\"quota\":{\"broken\":{\"reset_time\":1790000000},\"fast\":{\"remaining_fraction\":0.1}}}", &buf, 1000);
+    try std.testing.expectEqual(@as(usize, 1), q.windows.len);
+    try std.testing.expectEqualStrings("fast", q.windows[0].name);
+}
+
+test "collectQuota reports nothing when the payload carries no quota" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    var buf: [quota_mod.max_windows]quota_mod.Window = undefined;
+    const q = try testQuota(a.allocator(), "{\"cwd\":\"C:/x\"}", &buf, 1000);
+    try std.testing.expectEqual(@as(usize, 0), q.windows.len);
+    // An empty bucket map is the same nothing, not an "agy" line with no fields.
+    const empty = try testQuota(a.allocator(), "{\"quota\":{}}", &buf, 1000);
+    try std.testing.expectEqual(@as(usize, 0), empty.windows.len);
 }
