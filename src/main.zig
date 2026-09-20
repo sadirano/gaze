@@ -19,6 +19,7 @@ const dirty_mod = @import("dirty.zig");
 const hoot_mod = @import("hoot.zig");
 const quota_mod = @import("quota.zig");
 const cache = @import("cache.zig");
+const codex_quota = @import("codex_quota.zig");
 
 const usage =
     \\gaze - Claude Code status line
@@ -95,6 +96,9 @@ pub fn main(init: std.process.Init) !void {
     defer out.flush() catch {};
 
     const args = try init.minimal.args.toSlice(arena);
+    if (args.len > 1 and std.mem.eql(u8, args[1], "codex-quota")) {
+        return codex_quota.run(init, args[2..]);
+    }
     const cfg = parseArgs(arena, args[1..], init.environ_map) catch {
         try out.writeAll(usage);
         return;
@@ -410,7 +414,13 @@ fn collectQuota(root: std.json.Value, buf: []quota_mod.Window, now: i64) Quota {
             var it = v.object.iterator();
             while (it.next()) |e| {
                 if (n >= buf.len) break;
-                const remaining = numAt(e.value_ptr.*, &.{"remaining_fraction"}) orelse continue;
+                // Collectors such as Codex already know usage. Accept that
+                // directly, without a used -> remaining -> used round trip.
+                const used = numAt(e.value_ptr.*, &.{"used_percentage"}) orelse blk: {
+                    const remaining = numAt(e.value_ptr.*, &.{"remaining_fraction"}) orelse continue;
+                    break :blk (1.0 - remaining) * 100.0;
+                };
+                if (!std.math.isFinite(used) or used < 0 or used > 100) continue;
                 var reset = roundOr(numAt(e.value_ptr.*, &.{"reset_time"}));
                 // A countdown is as good as a timestamp once it is anchored, and
                 // the log only ever stores the absolute form.
@@ -421,7 +431,7 @@ fn collectQuota(root: std.json.Value, buf: []quota_mod.Window, now: i64) Quota {
                 }
                 buf[n] = .{
                     .name = e.key_ptr.*,
-                    .pct = @intFromFloat(@round((1.0 - remaining) * 100.0)),
+                    .pct = @intFromFloat(@round(used)),
                     .reset = reset,
                 };
                 n += 1;
@@ -614,6 +624,7 @@ fn numAt(root: std.json.Value, path: []const []const u8) ?f64 {
 // when something in the test root references it, so until this block only
 // main.zig's ran and the quota dedupe rule went untested by the gate.
 test {
+    _ = codex_quota;
     _ = cache;
     _ = git;
     _ = quota_mod;
@@ -716,6 +727,26 @@ test "collectQuota anchors a countdown to now" {
     const q = try testQuota(a.allocator(), "{\"quota\":{\"fast\":{\"remaining_fraction\":0.5,\"reset_in_seconds\":14400}}}", &buf, 1000);
     try std.testing.expectEqual(@as(i64, 50), q.windows[0].pct);
     try std.testing.expectEqual(@as(i64, 15400), q.windows[0].reset);
+}
+
+test "collectQuota accepts used percentages directly without a round trip" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    var buf: [quota_mod.max_windows]quota_mod.Window = undefined;
+    const q = try testQuota(a.allocator(), "{\"quota\":{\"5h\":{\"used_percentage\":19.5,\"reset_time\":1789943916},\"7d\":{\"used_percentage\":0,\"remaining_fraction\":0.1}}}", &buf, 1000);
+    try std.testing.expectEqual(@as(usize, 2), q.windows.len);
+    try std.testing.expectEqual(@as(i64, 20), q.windows[0].pct);
+    try std.testing.expectEqual(@as(i64, 1789943916), q.windows[0].reset);
+    try std.testing.expectEqual(@as(i64, 0), q.windows[1].pct);
+}
+
+test "collectQuota drops invalid percentages while keeping valid siblings" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    var buf: [quota_mod.max_windows]quota_mod.Window = undefined;
+    const q = try testQuota(a.allocator(), "{\"quota\":{\"bad\":{\"used_percentage\":101},\"negative\":{\"remaining_fraction\":1.5},\"good\":{\"used_percentage\":3}}}", &buf, 1000);
+    try std.testing.expectEqual(@as(usize, 1), q.windows.len);
+    try std.testing.expectEqualStrings("good", q.windows[0].name);
 }
 
 test "collectQuota skips a bucket that says nothing about what is left" {

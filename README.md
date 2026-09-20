@@ -135,6 +135,37 @@ the old rules.
 
 ## Install
 
+### Codex account quota
+
+`x gaze :codex-quota` reads the signed-in Codex account's limits and records a
+sample in `quota-codex.log`. `x gaze :codex-quota-watch` repeats every five
+minutes until stopped (Ctrl+C). Build gaze first. The collector needs Python 3
+and `codex` on PATH, signed in with the same ChatGPT account as the desktop app.
+It starts a private stdio app-server and closes it after the read. Pass
+`-- --proxy` to use an existing shared Codex daemon instead. Run it from your
+normal user terminal: an agent sandbox may lack access to Codex's runtime even
+when it can read project files.
+
+The bridge uses the official
+[account/rateLimits/read protocol](https://learn.chatgpt.com/docs/app-server),
+not a model turn. These are account-wide limits, not this task's token usage.
+It prefers `rateLimitsByLimitId`, keeps additional buckets distinct, derives
+window labels from their durations, and skips missing percentages. It passes
+the normalized quota map (`used_percentage`, optional `reset_time`) to gaze with
+`--source codex`; gaze owns the log format
+and deduplication. No credentials or account identifiers go into the quota log.
+An unavailable service produces an error and leaves the last sample to age;
+it never writes a fabricated zero. `--input response.json` can record an
+already-obtained response, and `--directory PATH` isolates a test's logs.
+
+Display it with `x han :quota-codex`. The collector and panel are independent;
+neither action installs an autostart task. These optional integration actions
+require Codex and Python; normal gaze builds and status-line rendering do not.
+`x gaze :test-codex` runs the bridge
+tests without an account or network.
+
+### Claude status line
+
 Register the project with [nix](https://github.com/sadirano/nix), then build:
 
 ```
