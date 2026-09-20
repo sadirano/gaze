@@ -167,7 +167,7 @@ fn string(v: ?Value) ?[]const u8 {
     };
 }
 
-fn windowName(a: Allocator, bucket: []const u8, slot: []const u8, minutes: ?f64) ![]const u8 {
+pub fn windowName(a: Allocator, bucket: []const u8, slot: []const u8, minutes: ?f64) ![]const u8 {
     var duration: []const u8 = slot;
     if (minutes) |m| {
         if (m > 0 and m < 1e12 and @floor(m) == m) {

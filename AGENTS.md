@@ -39,6 +39,9 @@ If you need a new segment that requires spawning something, put it behind
 | `src/hoot.zig` | the `hoot count` call, behind the cache |
 | `src/cache.zig` | `<unix seconds> <value>` one-line cache in the temp dir |
 | `src/quota.zig` | appends each source's quota samples to its own durable log, deduped |
+| `src/codex_quota.zig` | `gaze codex-quota`: the JSON-RPC collector. Never on the render path |
+| `src/codex_peek.zig` | Codex's limits, read from its session transcripts. Cached |
+| `src/peers.zig` | the other sources' levels, read from their logs |
 
 ## Build and test
 
@@ -71,6 +74,38 @@ of every one of them.
 **A payload shape is not guessable from the outside.** Set `GAZE_DUMP_PAYLOAD`
 to a path and run one session of the tool: it writes the raw stdin there every
 render. Do that before writing a parser, not after.
+
+## Two ways to learn a tool's quota, and when each is allowed
+
+Claude Code and Antigravity are status lines: they hand gaze a payload, so their
+logs write themselves for free. Codex is not, which leaves two routes, and the
+distinction is load-bearing:
+
+- **`codex_peek.zig` - read what the tool already wrote.** Codex records
+  `rate_limits` into its own session rollouts, so gaze reads the tail of the
+  newest one. No spawn, no request, and an idle Codex is never polled. This is
+  the only route the render path may take, and even it sits behind `cache.zig`
+  (`--codex-ttl`) because the walk costs ~1ms.
+- **`codex_quota.zig` - ask the tool.** A spawn plus a daemon round trip.
+  Authoritative and on demand, and **never callable from a render**. `main.zig`
+  dispatches it as the `codex-quota` subcommand before the status line path
+  begins, which is what keeps that rule structural rather than a convention.
+
+Both routes name windows through `codex_quota.windowName`, so a sample recorded
+by a peek and one recorded by a refresh cannot land under different names. The
+two surfaces spell the fields differently - the app-server sends `usedPercent`,
+the transcript `used_percent` - and that is the only thing that differs.
+
+Before adding a third tool, look for what it already writes to disk. perch reads
+Claude Code's transcripts, gaze reads `.git/HEAD`, and this is the same move.
+
+## Showing another tool's level honestly
+
+`peers.zig` renders a source's log that this session did not write. A number
+from another process is stale by construction, so two rules keep it from
+lying: a window past its `reset` reads as 0% without asking anyone, and a sample
+older than `stale_after_s` is marked `~`. If you add a third display rule, make
+sure it also fails towards "say less" rather than "guess".
 
 ## Changing the rendered line
 

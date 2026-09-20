@@ -20,6 +20,8 @@ const hoot_mod = @import("hoot.zig");
 const quota_mod = @import("quota.zig");
 const cache = @import("cache.zig");
 const codex_quota = @import("codex_quota.zig");
+const codex_peek = @import("codex_peek.zig");
+const peers_mod = @import("peers.zig");
 
 const usage =
     \\gaze - Claude Code status line
@@ -35,9 +37,20 @@ const usage =
     \\  --no-quota-log         do not append quota samples to the log
     \\  --source <name>        file the quota samples under this tool's name
     \\                         instead of the one inferred from the payload
+    \\  --no-peers             do not show what the other tools have left
+    \\  --codex-ttl <seconds>  how often to re-read Codex's transcripts
+    \\                         (default 60; 0 re-reads on every render)
     \\  -h, --help             this text
     \\
-    \\GAZE_DIRTY_TTL, GAZE_HOOT_TTL and GAZE_SOURCE set the same three; flags win.
+    \\GAZE_DIRTY_TTL, GAZE_HOOT_TTL, GAZE_CODEX_TTL and GAZE_SOURCE set the same
+    \\intervals and name; flags win.
+    \\
+    \\Every OTHER source's level is shown too, read from its own log - so free
+    \\quota somewhere else is a glance rather than a question. A window past its
+    \\reset reads as 0% without asking anyone; a sample older than 30 minutes is
+    \\marked `~`. Codex is nobody's status line, so its log is kept current from
+    \\the rate_limits its own session transcripts already carry - a file read,
+    \\never a request. `gaze codex-quota` is the authoritative on-demand refresh.
     \\
     \\The quota percentages are also appended to <GAZE_QUOTA_DIR, or
     \\%LOCALAPPDATA%\gaze>\quota-<source>.log, one line per change, so that pace
@@ -73,6 +86,11 @@ const default_ttl_s: u32 = 10;
 /// can be while nothing is being spent.
 const default_quota_interval_s: i64 = 300;
 
+/// How often Codex's transcripts are re-read. Unlike the two spawns, this is
+/// only a directory walk and a tail read - but it is still far more than the
+/// rest of a render, and Codex's number cannot move while Codex is not running.
+const default_codex_ttl_s: u32 = 60;
+
 const Config = struct {
     dirty_ttl_s: u32 = default_ttl_s,
     hoot_ttl_s: u32 = default_ttl_s,
@@ -84,6 +102,10 @@ const Config = struct {
     /// payload shape; set only when a tool sends a shape gaze already knows but
     /// should not file under that tool's name.
     source: ?[]const u8 = null,
+    /// Show what the other tools have left, and keep Codex's log current from
+    /// its own transcripts.
+    peers: bool = true,
+    codex_ttl_s: u32 = default_codex_ttl_s,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -139,6 +161,7 @@ fn parseArgs(
     // Env first so an explicit flag can override it.
     if (envTtl(env, "GAZE_DIRTY_TTL")) |n| cfg.dirty_ttl_s = n;
     if (envTtl(env, "GAZE_HOOT_TTL")) |n| cfg.hoot_ttl_s = n;
+    if (envTtl(env, "GAZE_CODEX_TTL")) |n| cfg.codex_ttl_s = n;
     if (env.get("GAZE_SOURCE")) |s| {
         const t = std.mem.trim(u8, s, " \t");
         if (t.len > 0) cfg.source = t;
@@ -161,12 +184,20 @@ fn parseArgs(
             cfg.quota_log = false;
             continue;
         }
+        if (std.mem.eql(u8, a, "--no-peers")) {
+            cfg.peers = false;
+            continue;
+        }
         if (try ttlFlag(args, &i, "--dirty-ttl")) |n| {
             cfg.dirty_ttl_s = n;
             continue;
         }
         if (try ttlFlag(args, &i, "--hoot-ttl")) |n| {
             cfg.hoot_ttl_s = n;
+            continue;
+        }
+        if (try ttlFlag(args, &i, "--codex-ttl")) |n| {
+            cfg.codex_ttl_s = n;
             continue;
         }
         if (try valueFlag(args, &i, "--source")) |s| {
@@ -319,12 +350,36 @@ fn render(
 
     // The weekly allowance does not roll over, so pace matters as much as level
     // - and pace needs a history this payload does not carry. Log the sample.
+    const source = cfg.source orelse q.source;
+    const quota_dir = quotaDir(arena, env);
     if (cfg.quota_log) {
-        quota_mod.record(arena, io, quotaDir(arena, env), .{
+        quota_mod.record(arena, io, quota_dir, .{
             .now = now,
-            .source = cfg.source orelse q.source,
+            .source = source,
             .windows = q.windows,
         }, cfg.quota_interval_s);
+    }
+
+    // --- what the other tools have left ---
+    if (cfg.peers) {
+        // Codex is nobody's status line, so its log would go stale on its own.
+        // It writes its limits into its session transcripts, though, so keeping
+        // the log current costs a file read rather than a request.
+        if (!std.mem.eql(u8, source, "codex")) {
+            if (env.get("USERPROFILE") orelse env.get("HOME")) |home| {
+                codex_peek.refresh(arena, io, home, quota_dir, tmpDir(env), cfg.codex_ttl_s, now);
+            }
+        }
+        for (peers_mod.known) |peer| {
+            if (std.mem.eql(u8, peer, source)) continue;
+            const level = peers_mod.read(arena, io, quota_dir, peer, now) orelse continue;
+            try line.seg();
+            try line.color("90", try std.fmt.allocPrint(arena, "{s} {s}{d}%", .{
+                peer,
+                if (level.stale) "~" else "",
+                level.pct,
+            }));
+        }
     }
 
     // --- context window ---
@@ -625,6 +680,8 @@ fn numAt(root: std.json.Value, path: []const []const u8) ?f64 {
 // main.zig's ran and the quota dedupe rule went untested by the gate.
 test {
     _ = codex_quota;
+    _ = codex_peek;
+    _ = peers_mod;
     _ = cache;
     _ = git;
     _ = quota_mod;

@@ -34,6 +34,8 @@ Left to right, each one absent when its data is missing or zero:
   reset, red past 80%. Claude Code sends those two; Antigravity sends its own
   buckets and they render the same way. All of them are also appended to a quota
   log; see below.
+- **`agy 27%` / `codex ~98%`** - what the OTHER tools have left, so free quota
+  elsewhere is a glance rather than a question. See below.
 - **`#n%`** - context window used.
 - **`@n`** - cached context tokens (`cache_read + cache_creation`), k/M suffixed.
 - **`$n`** - session cost, hidden below half a cent so a fresh session shows
@@ -71,6 +73,9 @@ is a single short file, so it is always current and effectively free.
 --no-quota-log          do not append quota samples to the log
 --source <name>         file quota samples under this tool's name instead of
                         the one inferred from the payload
+--no-peers              do not show what the other tools have left
+--codex-ttl <seconds>   how often to re-read Codex's transcripts
+                        (default 60; 0 = every render)
 -h, --help
 ```
 
@@ -132,6 +137,50 @@ how a new tool's field names get learned in the first place.
 this shape. The first write after the upgrade renames it to `quota-v1.log` and
 starts the per-source files fresh. Nothing is lost; old history just reads with
 the old rules.
+
+## What the other tools have left
+
+Every source writes `quota-<source>.log`, so the tools' levels already sit on
+disk next to each other. gaze renders the ones this session is not:
+
+```
+(gaze) src > Opus 5  main clean  44% @3h48m / 51% @140h38m  agy 27%  codex 98%  15:21
+```
+
+One tail read per peer, no spawn. Two honesty rules, because showing a stale
+number as a current one is the failure this project refuses:
+
+- **A window past its reset is 0%**, known without asking anyone. That is the
+  one case where an old sample gets *more* accurate with age.
+- **Anything older than 30 minutes renders `~98%`**, because the tool has not
+  reported since and nobody knows what it did meanwhile.
+
+`--no-peers` turns the segment off.
+
+### Codex, which is nobody's status line
+
+Claude Code and Antigravity hand gaze a payload on every redraw, so their logs
+write themselves. Codex does not - and asking it costs a process spawn and a
+daemon round trip, which the render path cannot afford.
+
+It does not have to be asked. Codex already records its own limits: every
+session rollout under `~/.codex/sessions/<year>/<month>/<day>/rollout-*.jsonl`
+carries a `rate_limits` object, at the tail of the file where a positioned read
+finds it. So gaze reads the file - the same move as taking the branch from
+`.git/HEAD` rather than running `git`.
+
+That means **an idle Codex is never polled**: when nothing runs, nothing is
+written, and there is nothing to ask. The answer is exactly as fresh as Codex's
+own activity, which is the only thing that can move the number.
+
+The walk is four directory listings and a 64KB read - about 1ms, real next to a
+7ms render - so it sits behind `cache.zig` on `--codex-ttl` (default 60s). With
+the cache warm the whole peers segment costs about **0.1ms**.
+
+`gaze codex-quota` remains the authoritative on-demand refresh: it asks Codex's
+app-server directly over JSON-RPC, never starts a model turn, and writes through
+the same log. Use it when Codex has not run in hours and you want certainty
+rather than a last-known value. `--watch` is the unattended form.
 
 ## Install
 
