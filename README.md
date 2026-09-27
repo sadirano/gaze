@@ -271,7 +271,6 @@ checkout moves.
 
 ```
 x gaze :test       # zig build test
-x gaze :demo       # render a sample payload, coloured and stripped
 ```
 
 Every failure path in gaze degrades to a missing segment rather than an error:

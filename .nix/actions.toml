@@ -11,9 +11,6 @@ test = "zig build test"
 codex-quota = "gaze codex-quota {args}"
 codex-quota-watch = ":codex-quota --watch {args}"
 
-# Render a sample payload so a change to the line can be eyeballed.
-demo = "zig build -Doptimize=ReleaseFast && scripts/demo.sh"
-
 # Globally runnable via ~/.nix/bin (installed by `nix --sync-bin`).
 [bin]
 gaze = "zig-out/bin/gaze.exe"

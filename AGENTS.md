@@ -48,7 +48,6 @@ If you need a new segment that requires spawning something, put it behind
 ```
 x gaze :build     # ReleaseFast + nix --sync-bin
 x gaze :test      # unit tests
-x gaze :demo      # render a sample payload to look at
 ```
 
 ReleaseFast is not a preference. A Debug build gives back most of the startup
