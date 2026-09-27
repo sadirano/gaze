@@ -9,7 +9,7 @@ test = "zig build test"
 # Account-wide Codex quota, through its authenticated app-server; no model turns.
 # The render path never calls this - it is the authoritative on-demand refresh.
 codex-quota = "gaze codex-quota {args}"
-codex-quota-watch = "gaze codex-quota --watch {args}"
+codex-quota-watch = ":codex-quota --watch {args}"
 
 # Render a sample payload so a change to the line can be eyeballed.
 demo = "zig build -Doptimize=ReleaseFast && scripts/demo.sh"
