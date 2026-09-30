@@ -89,6 +89,8 @@ them cached, which is the point of the cache.
 
 ## The quota log
 
+Run `gaze quota` for a read-only pace report (`--brief` and `--json` are available).
+
 An allowance that does not roll over makes pace matter as much as level - and the
 payload only ever carries the level. Each render therefore appends its sample to
 `%LOCALAPPDATA%\gaze\quota-<source>.log` (`GAZE_QUOTA_DIR` overrides the

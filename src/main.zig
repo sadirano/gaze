@@ -20,6 +20,7 @@ const hoot_mod = @import("hoot.zig");
 const quota_mod = @import("quota.zig");
 const cache = @import("cache.zig");
 const codex_quota = @import("codex_quota.zig");
+const quota_report = @import("quota_report.zig");
 const codex_peek = @import("codex_peek.zig");
 const peers_mod = @import("peers.zig");
 
@@ -27,6 +28,7 @@ const usage =
     \\gaze - Claude Code status line
     \\
     \\Reads the status line JSON on stdin, writes one rendered line on stdout.
+    \\Run `gaze quota` for the read-only quota pace report.
     \\
     \\  --dirty-ttl <seconds>  how often to re-check git for uncommitted changes
     \\                         (default 10; 0 re-checks on every render)
@@ -125,6 +127,9 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
     if (args.len > 1 and std.mem.eql(u8, args[1], "codex-quota")) {
         return codex_quota.run(init, args[2..]);
+    }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "quota")) {
+        return quota_report.run(init, args[2..]);
     }
     const cfg = parseArgs(arena, args[1..], init.environ_map) catch {
         try out.writeAll(usage);
@@ -710,6 +715,7 @@ fn numAt(root: std.json.Value, path: []const []const u8) ?f64 {
 // main.zig's ran and the quota dedupe rule went untested by the gate.
 test {
     _ = codex_quota;
+    _ = quota_report;
     _ = codex_peek;
     _ = peers_mod;
     _ = cache;

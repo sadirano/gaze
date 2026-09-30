@@ -102,6 +102,15 @@ the transcript `used_percent` - and that is the only thing that differs.
 Before adding a third tool, look for what it already writes to disk. perch reads
 Claude Code's transcripts, gaze reads `.git/HEAD`, and this is the same move.
 
+## gaze quota
+
+`gaze quota` is a read-only, explicit report over each source's own
+`quota-<source>.log`. It computes the remaining 5h windows, learns weekly cost
+per 5h point from log history, and prints a table, `--brief`, or `--json`.
+`--hours` adjusts active time per day. `GAZE_QUOTA_NOW` overrides the clock for
+tests. Missing logs appear as unsampled buckets; this command is never called
+from the status-line render path.
+
 ## Showing another tool's level honestly
 
 `peers.zig` renders a source's log that this session did not write. A number
