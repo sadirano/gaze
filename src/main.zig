@@ -23,6 +23,7 @@ const codex_quota = @import("codex_quota.zig");
 const quota_report = @import("quota_report.zig");
 const codex_peek = @import("codex_peek.zig");
 const peers_mod = @import("peers.zig");
+const pace = @import("pace.zig");
 
 const usage =
     \\gaze - Claude Code status line
@@ -716,6 +717,7 @@ fn numAt(root: std.json.Value, path: []const []const u8) ?f64 {
 test {
     _ = codex_quota;
     _ = quota_report;
+    _ = pace;
     _ = codex_peek;
     _ = peers_mod;
     _ = cache;

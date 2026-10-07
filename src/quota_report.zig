@@ -23,16 +23,16 @@ const five_h: i64 = 5 * 3600;
 const week: i64 = 7 * 86400;
 const max_log: u64 = 64 * 1024 * 1024;
 const names = [_][]const u8{ "5h", "7d", "gemini-5h", "gemini-weekly", "3p-5h", "3p-weekly" };
-const Spec = struct { tool: []const u8, short: usize, weekly: usize, id: []const u8, name: []const u8, fallback: f64 };
-const specs = [_]Spec{
+pub const Spec = struct { tool: []const u8, short: usize, weekly: usize, id: []const u8, name: []const u8, fallback: f64 };
+pub const specs = [_]Spec{
     .{ .tool = "claude", .short = 0, .weekly = 1, .id = "claude/claude", .name = "Claude", .fallback = 0.125 },
     .{ .tool = "codex", .short = 0, .weekly = 1, .id = "codex/codex", .name = "Codex", .fallback = 0.15 },
     .{ .tool = "agy", .short = 2, .weekly = 3, .id = "agy/gemini", .name = "Agy gemini", .fallback = 0.17 },
     .{ .tool = "agy", .short = 4, .weekly = 5, .id = "agy/3p", .name = "Agy 3p", .fallback = 0.34 },
 };
 const Point = struct { pct: i64, reset: i64 };
-const Row = struct { ts: i64, fields: [names.len]?Point = @splat(null) };
-const Rows = []const Row;
+pub const Row = struct { ts: i64, fields: [names.len]?Point = @splat(null) };
+pub const Rows = []const Row;
 const WindowKey = struct { short: i64, weekly: i64 };
 const Window = struct { first_short: i64, max_short: i64, first_week: i64, last_week: i64 };
 const Ratio = struct { value: ?f64, windows: usize };
@@ -96,15 +96,20 @@ fn parseLog(a: Allocator, raw: []const u8) !Rows {
 }
 
 fn readLog(a: Allocator, io: Io, base: []const u8, tool: []const u8) !Rows {
+    return readLogTail(a, io, base, tool, max_log);
+}
+
+/// The last `max` bytes of a source's log, from the first whole line.
+pub fn readLogTail(a: Allocator, io: Io, base: []const u8, tool: []const u8, max: u64) !Rows {
     const path = try std.fmt.allocPrint(a, "{s}{c}quota-{s}.log", .{ base, std.fs.path.sep, tool });
     const file = Io.Dir.cwd().openFile(io, path, .{}) catch return &.{};
     defer file.close(io);
     const size = (file.stat(io) catch return &.{}).size;
-    const want = @min(size, max_log);
+    const want = @min(size, max);
     const buf = try a.alloc(u8, @intCast(want));
     const n = file.readPositionalAll(io, buf, size - want) catch return &.{};
     var data = buf[0..n];
-    if (size > max_log) {
+    if (size > max) {
         const end = std.mem.indexOfScalar(u8, data, '\n') orelse return &.{};
         data = data[end + 1 ..];
     }
@@ -127,7 +132,7 @@ fn resetKey(reset: i64) i64 {
     return @intFromFloat(halfEven(@as(f64, @floatFromInt(reset)) / 120));
 }
 
-fn learnRatio(a: Allocator, rows: Rows, short: usize, weekly: usize) !Ratio {
+pub fn learnRatio(a: Allocator, rows: Rows, short: usize, weekly: usize) !Ratio {
     var windows = std.AutoHashMap(WindowKey, Window).init(a);
     defer windows.deinit();
     for (rows) |row| {
@@ -271,7 +276,7 @@ fn civilDays(year: i64, month: i64, day: i64) i64 {
 fn wallSeconds(st: SYSTEMTIME) i64 {
     return civilDays(st.wYear, st.wMonth, st.wDay) * 86400 + @as(i64, st.wHour) * 3600 + @as(i64, st.wMinute) * 60 + st.wSecond;
 }
-fn localOffset() i64 {
+pub fn localOffset() i64 {
     if (@import("builtin").os.tag != .windows) return 0;
     var local: SYSTEMTIME = undefined;
     var utc: SYSTEMTIME = undefined;
