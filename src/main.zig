@@ -33,15 +33,17 @@ const usage =
     \\
     \\  --dirty-ttl <seconds>  how often to re-check git for uncommitted changes
     \\                         (default 10; 0 re-checks on every render)
-    \\  --hoot-ttl <seconds>   how often to re-check the hoot unseen count
-    \\                         (default 10; 0 re-checks on every render)
     \\  --no-dirty             never check git; show the branch alone
-    \\  --no-hoot              never check hoot; drop the badge
+    \\  --hoot                 show the unseen count of hoot, an optional notifier
+    \\                         (off by default; needs `hoot` on PATH)
+    \\  --hoot-ttl <seconds>   how often to re-check that count
+    \\                         (default 10; 0 re-checks on every render)
+    \\  --no-hoot              never check hoot, even with GAZE_HOOT=1
     \\  --no-quota-log         write no quota log at all: neither this tool's
     \\                         samples nor Codex's, read from its transcripts
     \\  --source <name>        file the quota samples under this tool's name
     \\                         instead of the one inferred from the payload
-    \\  --no-peers             do not show what the other tools have left
+    \\  --no-peers             do not show how much the other tools have used
     \\  --codex-ttl <seconds>  how often to re-read Codex's transcripts
     \\                         (default 60; 0 re-reads on every render)
     \\  --pace-ttl <seconds>   how often to re-learn pace inputs from the log
@@ -50,7 +52,8 @@ const usage =
     \\  -h, --help             this text
     \\
     \\GAZE_DIRTY_TTL, GAZE_HOOT_TTL, GAZE_CODEX_TTL, GAZE_PACE_TTL and GAZE_SOURCE
-    \\set the same intervals and name; flags win.
+    \\set the same intervals and name, and GAZE_HOOT=1 turns the hoot badge on;
+    \\flags win.
     \\
     \\Each of this tool's quota levels carries a pace glyph: `=` on an even burn,
     \\`-` behind, `+` ahead. Weekly `--` means one more skipped 5h window and the
@@ -58,22 +61,25 @@ const usage =
     \\5h `++` means past half and more than 10 points ahead. Weekly "even" runs on
     \\active hours learned from the log; `gaze quota` shows the numbers behind it.
     \\
-    \\Every OTHER source's level is shown too, read from its own log - so free
-    \\quota somewhere else is a glance rather than a question. One letter each:
-    \\C for Claude Code, A for Antigravity, X for CodeX. A tool metering several
-    \\independent allowances reports its emptiest one and names it - `Ag33%` is
-    \\Antigravity's Gemini tier, `Ac` its third-party one - so the number says
-    \\which model setting would actually receive the work.
+    \\Every OTHER source's level is shown too, read from its own log, as the
+    \\percentage USED - so free quota somewhere else is a glance rather than a
+    \\question. One letter each: C for Claude Code, A for Antigravity, X for CodeX.
+    \\A tool metering several independent allowances reports its least-used one
+    \\and names it - `Ag33%` is Antigravity's Gemini tier at 33% used, `Ac` its
+    \\third-party one - so the number says which model setting would actually
+    \\receive the work.
     \\
-    \\A window past its reset reads as 0% without asking anyone; a sample older
-    \\than 30 minutes is marked `~`. Codex is nobody's status line, so its log is
-    \\kept current from the rate_limits its own session transcripts already carry
-    \\- a file read, never a request. `gaze codex-quota` refreshes it for real.
+    \\A window past its reset reads as 0% (what was spent since is unknown); a
+    \\sample older than 30 minutes is marked `~`. Codex is nobody's status line, so
+    \\its log is kept current from the rate_limits its own session transcripts
+    \\already carry, filed under the time Codex wrote them - a file read, never a
+    \\request. `gaze codex-quota` refreshes it for real.
     \\
     \\The quota percentages are also appended to <GAZE_QUOTA_DIR, or
-    \\%LOCALAPPDATA%\gaze>\quota-<source>.log, one line per change, so that pace
-    \\can be computed from them. An allowance that does not roll over needs the
-    \\history; the payload only ever carries the current level.
+    \\%LOCALAPPDATA%\gaze>\quota-<source>.log, so that pace can be computed from
+    \\them: a line whenever a level or reset moves, and one every five minutes
+    \\while nothing moves, for as long as the line keeps redrawing. Nothing rotates
+    \\or trims the log; --no-quota-log stops every write to it.
     \\
     \\<source> is the tool that sent the payload - "claude" for Claude Code's
     \\rate_limits, "agy" for Antigravity's quota buckets - so two tools sharing
@@ -83,14 +89,14 @@ const usage =
     \\
     \\    1789924544 <tab> 5h=4@1789942200 <tab> 7d=47@1790434800
     \\
-    \\GAZE_DUMP_PAYLOAD, when set to a path, writes the raw stdin there on every
-    \\render - the way to learn a new tool's field names.
+    \\GAZE_DUMP_PAYLOAD, when set to a path, overwrites that file with the raw
+    \\stdin on every render - the way to learn a new tool's field names.
     \\
-    \\Both of those answers cost a process spawn (~37ms and ~26ms), far more
-    \\than everything else here put together, and neither changes anywhere near
-    \\as often as the line redraws - so both are polled on an interval and can
-    \\lag by up to it. The branch itself is always current: it is read straight
-    \\from .git/HEAD, which is just a file.
+    \\The dirty flag and the hoot count each cost a process spawn (~37ms and
+    \\~26ms), far more than everything else here put together, and neither changes
+    \\anywhere near as often as the line redraws - so both are polled on an
+    \\interval and can lag by up to it. The branch itself is always current: it is
+    \\read straight from .git/HEAD, which is just a file.
     \\
 ;
 
@@ -118,7 +124,8 @@ const Config = struct {
     dirty_ttl_s: u32 = default_ttl_s,
     hoot_ttl_s: u32 = default_ttl_s,
     check_dirty: bool = true,
-    check_hoot: bool = true,
+    /// hoot is an optional notifier; its badge is opt-in.
+    check_hoot: bool = false,
     quota_log: bool = true,
     quota_interval_s: i64 = default_quota_interval_s,
     /// Which tool's log this render belongs in. Normally inferred from the
@@ -191,6 +198,7 @@ fn parseArgs(
     if (envTtl(env, "GAZE_HOOT_TTL")) |n| cfg.hoot_ttl_s = n;
     if (envTtl(env, "GAZE_CODEX_TTL")) |n| cfg.codex_ttl_s = n;
     if (envTtl(env, "GAZE_PACE_TTL")) |n| cfg.pace_ttl_s = n;
+    if (env.get("GAZE_HOOT")) |v| cfg.check_hoot = std.mem.eql(u8, std.mem.trim(u8, v, " \t"), "1");
     if (env.get("GAZE_SOURCE")) |s| {
         const t = std.mem.trim(u8, s, " \t");
         if (t.len > 0) cfg.source = t;
@@ -203,6 +211,10 @@ fn parseArgs(
         if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) return null;
         if (std.mem.eql(u8, a, "--no-dirty")) {
             cfg.check_dirty = false;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--hoot")) {
+            cfg.check_hoot = true;
             continue;
         }
         if (std.mem.eql(u8, a, "--no-hoot")) {
@@ -393,7 +405,7 @@ fn render(
         }
     }
 
-    // --- hoot unseen badge ---
+    // --- hoot unseen badge, opt-in ---
     if (cfg.check_hoot) {
         if (hoot_mod.count(arena, io, cfg.hoot_ttl_s, tmpDir(env))) |n| {
             if (n > 0) {
@@ -760,8 +772,8 @@ fn dumpPayload(io: Io, env: *std.process.Environ.Map, raw: []const u8) void {
 }
 
 /// Where the quota log lives. Unlike the caches in `tmpDir`, this is history
-/// that has to survive a temp sweep, so it goes beside hoot's database rather
-/// than in TEMP. GAZE_QUOTA_DIR overrides it, which is also how the tests keep
+/// that has to survive a temp sweep, so it goes in the user's local state
+/// directory rather than in TEMP. GAZE_QUOTA_DIR overrides it, which is also how the tests keep
 /// off the real one.
 fn quotaDir(arena: std.mem.Allocator, env: *std.process.Environ.Map) []const u8 {
     if (env.get("GAZE_QUOTA_DIR")) |d| return d;
@@ -852,6 +864,17 @@ test {
     _ = cache;
     _ = git;
     _ = quota_mod;
+}
+
+test "the hoot badge is opt-in, and --no-hoot wins over the environment" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    var env: std.process.Environ.Map = .init(a.allocator());
+    try std.testing.expect(!(try parseArgs(a.allocator(), &.{}, &env)).?.check_hoot);
+    try std.testing.expect((try parseArgs(a.allocator(), &.{"--hoot"}, &env)).?.check_hoot);
+    try env.put("GAZE_HOOT", "1");
+    try std.testing.expect((try parseArgs(a.allocator(), &.{}, &env)).?.check_hoot);
+    try std.testing.expect(!(try parseArgs(a.allocator(), &.{"--no-hoot"}, &env)).?.check_hoot);
 }
 
 test "relativeToAlias strips the root" {

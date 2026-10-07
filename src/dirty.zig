@@ -32,18 +32,27 @@ pub fn check(
         if (cache.read(arena, io, path, ttl_s, now)) |v| {
             if (std.mem.eql(u8, v, "1")) return .dirty;
             if (std.mem.eql(u8, v, "0")) return .clean;
+            if (std.mem.eql(u8, v, "?")) return .unknown;
         }
     }
 
     const fresh = runGit(arena, io, work_dir);
     // A failed write only costs us the cache, never correctness. `unknown` is
-    // never cached: it usually means git was momentarily unavailable, and
-    // pinning that for the whole interval would blank the segment needlessly.
-    if (fresh != .unknown) {
-        cache.write(io, path, if (fresh == .dirty) "1" else "0", now) catch {};
-    }
+    // cached too: a missing or failing git would otherwise be spawned on every
+    // render. The cost is a blank flag for up to one interval after git
+    // recovers.
+    const text: []const u8 = switch (fresh) {
+        .dirty => "1",
+        .clean => "0",
+        .unknown => "?",
+    };
+    cache.write(io, path, text, now) catch {};
     return fresh;
 }
+
+/// Longest `git status` may take before the render gives up on it. A huge or
+/// cold working tree then shows no flag rather than stalling the line.
+const git_timeout_ms = 1000;
 
 /// One `git status --porcelain` run. Any entry at all means dirty. Failure to
 /// run git (absent, or no longer a repo) is `unknown`, which the caller renders
@@ -54,6 +63,7 @@ fn runGit(arena: std.mem.Allocator, io: Io, work_dir: []const u8) State {
         .cwd = .{ .path = work_dir },
         .stdout_limit = .limited(1 << 20),
         .stderr_limit = .limited(4096),
+        .timeout = .{ .duration = .{ .raw = .fromMilliseconds(git_timeout_ms), .clock = .awake } },
     }) catch return .unknown;
 
     switch (res.term) {
