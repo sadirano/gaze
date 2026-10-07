@@ -65,11 +65,11 @@ pub fn refresh(
     const observed = @min(s.observed, now);
     // Only ever move the log forward: a transcript sample no newer than the
     // log's last line (an explicit `gaze codex-quota` refresh, say) is old news.
-    if (lastLogTime(arena, io, quota_dir)) |last| if (observed <= last) return;
     quota.record(arena, io, quota_dir, .{
         .now = observed,
         .source = "codex",
         .windows = s.windows,
+        .only_if_newer = true,
     }, 300);
 }
 
@@ -78,27 +78,6 @@ pub const Sample = struct {
     /// Unix seconds at which Codex recorded it.
     observed: i64,
 };
-
-/// The timestamp of the last complete line of `quota-codex.log`, if any.
-fn lastLogTime(arena: std.mem.Allocator, io: Io, quota_dir: []const u8) ?i64 {
-    const path = std.fmt.allocPrint(arena, "{s}{c}quota-codex.log", .{ quota_dir, std.fs.path.sep }) catch return null;
-    const file = Io.Dir.cwd().openFile(io, path, .{}) catch return null;
-    defer file.close(io);
-    const size = (file.stat(io) catch return null).size;
-    var buf: [512]u8 = undefined;
-    const want = @min(size, buf.len);
-    const n = file.readPositionalAll(io, buf[0..@intCast(want)], size - want) catch return null;
-    return lineTime(buf[0..n]);
-}
-
-/// The leading timestamp of the last newline-terminated line in `tail`.
-fn lineTime(tail: []const u8) ?i64 {
-    const end = std.mem.lastIndexOfScalar(u8, tail, '\n') orelse return null;
-    const begin = if (std.mem.lastIndexOfScalar(u8, tail[0..end], '\n')) |i| i + 1 else 0;
-    const line = tail[begin..end];
-    const tab = std.mem.indexOfScalar(u8, line, '\t') orelse line.len;
-    return std.fmt.parseInt(i64, line[0..tab], 10) catch null;
-}
 
 /// The newest quota sample Codex has written, or null when there is none.
 pub fn sample(arena: std.mem.Allocator, io: Io, home: []const u8) ?Sample {
@@ -167,17 +146,15 @@ fn greatestFiles(arena: std.mem.Allocator, io: Io, dir: Io.Dir, out: [][]const u
 fn readSample(arena: std.mem.Allocator, io: Io, dir: Io.Dir, name: []const u8) ?Sample {
     const file = dir.openFile(io, name, .{}) catch return null;
     defer file.close(io);
-    const st = file.stat(io) catch return null;
-    const size = st.size;
+    const size = (file.stat(io) catch return null).size;
 
     const want = @min(size, tail_bytes);
     const buf = arena.alloc(u8, @intCast(want)) catch return null;
     const n = file.readPositionalAll(io, buf, size - want) catch return null;
     const found = parseTail(arena, buf[0..n]) orelse return null;
-    // A record without a readable timestamp falls back to the file's last
-    // write, which is never older than the record itself.
-    const mtime: i64 = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
-    return .{ .windows = found.windows, .observed = found.observed orelse mtime };
+    // A record with no readable time is skipped: the file's mtime moves with
+    // every later append, so it would make an old sample look fresh.
+    return .{ .windows = found.windows, .observed = found.observed orelse return null };
 }
 
 pub const Found = struct {
@@ -205,32 +182,48 @@ pub fn parseTail(arena: std.mem.Allocator, tail: []const u8) ?Found {
     return null;
 }
 
+/// Plain decimal digits as a number; null on anything else, signs included.
+fn digits(s: []const u8) ?i64 {
+    var n: i64 = 0;
+    for (s) |c| {
+        if (!std.ascii.isDigit(c)) return null;
+        n = n * 10 + (c - '0');
+    }
+    return n;
+}
+
 /// The `"timestamp":"<ISO 8601 UTC>"` a rollout record opens with, as unix
 /// seconds. Null when the prefix holds none, or one this does not read: the
-/// caller then falls back to the file time rather than guessing.
+/// sample is then skipped rather than given a guessed time.
 fn recordTime(prefix: []const u8) ?i64 {
     const key = "\"timestamp\":\"";
     const i = std.mem.indexOf(u8, prefix, key) orelse return null;
     return parseIsoUtc(prefix[i + key.len ..]);
 }
 
-/// `YYYY-MM-DDTHH:MM:SS[.fff]Z` as unix seconds. Only UTC (`Z`) is accepted.
+/// `YYYY-MM-DDTHH:MM:SS[.fff]Z` as unix seconds. Only UTC (`Z`), only a real
+/// calendar date, and the `Z` must end the value.
 fn parseIsoUtc(s: []const u8) ?i64 {
     if (s.len < 20 or s[4] != '-' or s[7] != '-' or s[10] != 'T' or s[13] != ':' or s[16] != ':') return null;
-    const y = std.fmt.parseInt(i64, s[0..4], 10) catch return null;
-    const mo = std.fmt.parseInt(i64, s[5..7], 10) catch return null;
-    const d = std.fmt.parseInt(i64, s[8..10], 10) catch return null;
-    const h = std.fmt.parseInt(i64, s[11..13], 10) catch return null;
-    const mi = std.fmt.parseInt(i64, s[14..16], 10) catch return null;
-    const se = std.fmt.parseInt(i64, s[17..19], 10) catch return null;
+    const y = digits(s[0..4]) orelse return null;
+    const mo = digits(s[5..7]) orelse return null;
+    const d = digits(s[8..10]) orelse return null;
+    const h = digits(s[11..13]) orelse return null;
+    const mi = digits(s[14..16]) orelse return null;
+    const se = digits(s[17..19]) orelse return null;
     var rest = s[19..];
     if (rest.len > 0 and rest[0] == '.') {
         var k: usize = 1;
         while (k < rest.len and std.ascii.isDigit(rest[k])) k += 1;
+        if (k == 1) return null;
         rest = rest[k..];
     }
     if (rest.len == 0 or rest[0] != 'Z') return null;
-    if (mo < 1 or mo > 12 or d < 1 or d > 31 or h > 23 or mi > 59 or se > 60) return null;
+    if (rest.len > 1 and rest[1] != '"') return null;
+    if (mo < 1 or mo > 12 or h > 23 or mi > 59 or se > 59) return null;
+    const leap = @mod(y, 4) == 0 and (@mod(y, 100) != 0 or @mod(y, 400) == 0);
+    const month_days = [_]i64{ 31, if (leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (d < 1 or d > month_days[@intCast(mo - 1)]) return null;
     // Days from civil (Howard Hinnant's algorithm), proleptic Gregorian.
     const yy = if (mo <= 2) y - 1 else y;
     const era = @divFloor(yy, 400);
@@ -408,7 +401,7 @@ test "parseTail carries the record's own time" {
     var a = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer a.deinit();
     try std.testing.expectEqual(@as(?i64, 1789898400), parseTail(a.allocator(), real_tail).?.observed);
-    // No timestamp in the record: unknown here, and the caller uses the file time.
+    // No timestamp in the record: unknown, and the caller skips the sample.
     const bare =
         \\{"rate_limits":{"primary":{"used_percent":40,"window_minutes":300}}}
     ;
@@ -421,6 +414,12 @@ test "parseIsoUtc reads UTC and refuses what it cannot be sure of" {
     try std.testing.expectEqual(@as(?i64, null), parseIsoUtc("2026-09-20T10:00:00+02:00"));
     try std.testing.expectEqual(@as(?i64, null), parseIsoUtc("2026-13-20T10:00:00Z"));
     try std.testing.expectEqual(@as(?i64, null), parseIsoUtc("yesterday"));
+    try std.testing.expectEqual(@as(?i64, null), parseIsoUtc("2026-02-31T10:00:00Z"));
+    try std.testing.expectEqual(@as(?i64, null), parseIsoUtc("2026-02-29T10:00:00Z"));
+    try std.testing.expectEqual(@as(?i64, null), parseIsoUtc("2026-09-20T-1:00:00Z"));
+    try std.testing.expectEqual(@as(?i64, null), parseIsoUtc("2026-09-20T10:00:60Z"));
+    try std.testing.expectEqual(@as(?i64, null), parseIsoUtc("2026-09-20T10:00:00.Z"));
+    try std.testing.expectEqual(@as(?i64, null), parseIsoUtc("2026-09-20T10:00:00Zjunk"));
 }
 
 test "refresh files a sample under Codex's time and never moves the log back" {
@@ -450,8 +449,3 @@ test "refresh files a sample under Codex's time and never moves the log back" {
     try std.testing.expectEqualStrings("1789900000\t5h=96@1789943916\t7d=15@1790530716\n", kept);
 }
 
-test "lineTime reads only a complete last line" {
-    try std.testing.expectEqual(@as(?i64, 20), lineTime("10\ta=1\n20\ta=2\n"));
-    try std.testing.expectEqual(@as(?i64, 10), lineTime("10\ta=1\n20\ta="));
-    try std.testing.expectEqual(@as(?i64, null), lineTime(""));
-}

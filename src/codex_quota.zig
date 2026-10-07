@@ -149,7 +149,7 @@ fn verifyLastLine(tail: []const u8, sample: quota.Sample) !void {
         else
             quota.absent;
         if ((logged == quota.absent) != (w.reset == quota.absent)) return error.SampleNotRecorded;
-        if (@abs(logged - w.reset) > quota.reset_tolerance_s) return error.SampleNotRecorded;
+        if (@abs(@as(i128, logged) - w.reset) > quota.reset_tolerance_s) return error.SampleNotRecorded;
         count += 1;
     }
     if (count != sample.windows.len) return error.SampleNotRecorded;

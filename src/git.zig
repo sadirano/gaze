@@ -59,7 +59,12 @@ pub fn find(arena: std.mem.Allocator, io: Io, start: []const u8) ?Repo {
 
         // A `.git` that exists but could not be read either way is still the
         // nearest repo. Walking past it would show an enclosing repo's branch.
-        if (Io.Dir.cwd().statFile(io, dot_git, .{})) |_| return null else |_| {}
+        // Only a `.git` known to be absent lets the walk go on: an access
+        // error is "cannot tell", which is no branch, not the parent's.
+        if (Io.Dir.cwd().statFile(io, dot_git, .{})) |_| return null else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return null,
+        }
 
         const parent = std.fs.path.dirname(dir) orelse return null;
         if (parent.len == dir.len) return null; // reached the root

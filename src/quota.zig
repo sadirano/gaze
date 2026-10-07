@@ -64,6 +64,11 @@ pub const Sample = struct {
     /// Which tool this came from: the log file is named after it.
     source: []const u8,
     windows: []const Window,
+    /// Write only when `now` is later than the log's last line. Set by a
+    /// sample read from a transcript, which may be older than what an explicit
+    /// refresh already wrote; checked under the state lock so no writer can
+    /// slip in between the check and the append.
+    only_if_newer: bool = false,
 };
 
 /// Tab-separated so it stays greppable and parses with a split: ASCII only, one
@@ -194,7 +199,9 @@ fn sameKey(old: []const u8, new: []const u8) bool {
         if (xa == null) continue;
         const xr = std.fmt.parseInt(i64, x.?[xa.? + 1 ..], 10) catch return false;
         const yr = std.fmt.parseInt(i64, y.?[ya.? + 1 ..], 10) catch return false;
-        if (@abs(xr - yr) > reset_tolerance_s) return false;
+        // Widened: a damaged state file can hold any i64, and the difference
+        // of two of them overflows.
+        if (@abs(@as(i128, xr) - yr) > reset_tolerance_s) return false;
     }
 }
 
@@ -244,6 +251,9 @@ pub fn record(
     // An empty state file is one this call just created: no state.
     const held: ?[]const u8 = if (held_n == 0) null else held_buf[0..held_n];
     if (!shouldWrite(held, s.now, key, min_interval_s)) return;
+    if (s.only_if_newer) {
+        if (lastLogTime(io, log_path)) |last| if (s.now <= last) return;
+    }
 
     // No state means this is the first line this source has ever written, which
     // is the one moment a pre-source log can still be sitting there unnamed.
@@ -259,6 +269,26 @@ pub fn record(
     const state_line = std.fmt.bufPrint(&state_buf, "{d}\t{s}", .{ s.now, key }) catch return;
     lock.writePositionalAll(io, state_line, 0) catch return;
     lock.setLength(io, state_line.len) catch {};
+}
+
+/// The timestamp of the last complete line of the log at `path`, if any.
+pub fn lastLogTime(io: Io, path: []const u8) ?i64 {
+    const file = Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+    const size = (file.stat(io) catch return null).size;
+    var buf: [512]u8 = undefined;
+    const want = @min(size, buf.len);
+    const n = file.readPositionalAll(io, buf[0..@intCast(want)], size - want) catch return null;
+    return lineTime(buf[0..n]);
+}
+
+/// The leading timestamp of the last newline-terminated line in `tail`.
+pub fn lineTime(tail: []const u8) ?i64 {
+    const end = std.mem.lastIndexOfScalar(u8, tail, '\n') orelse return null;
+    const begin = if (std.mem.lastIndexOfScalar(u8, tail[0..end], '\n')) |i| i + 1 else 0;
+    const line = tail[begin..end];
+    const tab = std.mem.indexOfScalar(u8, line, '\t') orelse line.len;
+    return std.fmt.parseInt(i64, line[0..tab], 10) catch null;
 }
 
 /// Move a log written before sources existed out of the way, once.
@@ -388,6 +418,16 @@ test "shouldWrite ignores a countdown reset's jitter" {
     try std.testing.expect(shouldWrite("990\tfast=10@5000", 1000, "fast=10@4879", 300));
 }
 
+test "shouldWrite survives extreme resets in a damaged state file" {
+    try std.testing.expect(shouldWrite("990\t5h=1@-9223372036854775807", 1000, "5h=1@5000", 300));
+}
+
+test "lineTime reads only a complete last line" {
+    try std.testing.expectEqual(@as(?i64, 20), lineTime("10\ta=1\n20\ta=2\n"));
+    try std.testing.expectEqual(@as(?i64, 10), lineTime("10\ta=1\n20\ta="));
+    try std.testing.expectEqual(@as(?i64, null), lineTime(""));
+}
+
 test "shouldWrite records unchanged percentages past the interval" {
     try std.testing.expect(shouldWrite("600\t5h=50 7d=10", 1000, "5h=50 7d=10", 300));
     // The boundary itself counts as elapsed.
@@ -450,6 +490,23 @@ test "record writes a moved sample once and keeps the state in step" {
     );
     const state = try tmp.dir.readFileAlloc(io, "quota-claude.state", g, .limited(4096));
     try std.testing.expectEqualStrings("1010\t5h=5@1789942200 7d=47@1790434800", state);
+}
+
+test "record with only_if_newer never puts an older sample last" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const g = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    record(g, io, dir, .{ .now = 2000, .source = "codex", .windows = &claude_windows }, 300);
+    var older = claude_windows;
+    older[0].pct = 9;
+    record(g, io, dir, .{ .now = 1500, .source = "codex", .windows = &older, .only_if_newer = true }, 300);
+    const log = try tmp.dir.readFileAlloc(io, "quota-codex.log", g, .limited(4096));
+    try std.testing.expectEqualStrings("2000\t5h=4@1789942200\t7d=47@1790434800\n", log);
 }
 
 test "record stands down while another writer holds the state lock" {
