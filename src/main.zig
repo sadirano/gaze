@@ -301,10 +301,40 @@ const Line = struct {
         self.started = true;
     }
 
+    /// `text` may come from the payload or the environment, so it is cleaned on
+    /// the way out; only gaze's own `code` reaches the terminal as a sequence.
     fn color(self: *Line, code: []const u8, text: []const u8) !void {
-        try self.w.print("\x1b[{s}m{s}\x1b[0m", .{ code, text });
+        try self.w.print("\x1b[{s}m", .{code});
+        try writeClean(self.w, text);
+        try self.w.writeAll("\x1b[0m");
     }
 };
+
+/// `text` with every C0 control, DEL and UTF-8-encoded C1 control replaced by
+/// `?`. A newline would break the one-line contract, and an escape or CSI
+/// would let a crafted path or model name drive the terminal.
+fn writeClean(w: *Io.Writer, text: []const u8) !void {
+    var i: usize = 0;
+    var start: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        const width: usize = if (c < 0x20 or c == 0x7f)
+            1
+        else if (c == 0xc2 and i + 1 < text.len and text[i + 1] >= 0x80 and text[i + 1] <= 0x9f)
+            2
+        else
+            0;
+        if (width == 0) {
+            i += 1;
+            continue;
+        }
+        try w.writeAll(text[start..i]);
+        try w.writeAll("?");
+        i += width;
+        start = i;
+    }
+    try w.writeAll(text[start..]);
+}
 
 fn render(
     arena: std.mem.Allocator,
@@ -386,6 +416,8 @@ fn render(
     // a bare row of four percentages would say nothing about which is which.
     var group: ?[]const u8 = null;
     for (q.windows, 0..) |w, wi| {
+        // A window the payload named but gave no level for is absent, not 0%.
+        if (w.pct == quota_mod.absent) continue;
         const g = quota_mod.groupOf(w.name);
         if (group == null or !std.mem.eql(u8, g, group.?)) {
             try line.seg();
@@ -437,15 +469,15 @@ fn render(
     }
 
     // --- context window ---
-    if (numAt(root, &.{ "context_window", "used_percentage" })) |ctx| {
+    if (whole(numAt(root, &.{ "context_window", "used_percentage" }))) |ctx| {
         try line.seg();
-        try line.color("32", try std.fmt.allocPrint(arena, "#{d}%", .{@as(i64, @intFromFloat(ctx))}));
+        try line.color("32", try std.fmt.allocPrint(arena, "#{d}%", .{ctx}));
     }
 
     // --- cached tokens ---
-    const cr = numAt(root, &.{ "context_window", "current_usage", "cache_read_input_tokens" }) orelse 0;
-    const cc = numAt(root, &.{ "context_window", "current_usage", "cache_creation_input_tokens" }) orelse 0;
-    const cached: i64 = @intFromFloat(cr + cc);
+    const cr = whole(numAt(root, &.{ "context_window", "current_usage", "cache_read_input_tokens" })) orelse 0;
+    const cc = whole(numAt(root, &.{ "context_window", "current_usage", "cache_creation_input_tokens" })) orelse 0;
+    const cached = cr + cc;
     if (cached > 0) {
         try line.seg();
         try line.color("90", try std.fmt.allocPrint(arena, "@{s}", .{try formatTokens(arena, cached)}));
@@ -453,15 +485,16 @@ fn render(
 
     // --- session cost, hidden below half a cent ---
     if (numAt(root, &.{ "cost", "total_cost_usd" })) |cost| {
-        if (@round(cost * 100.0) / 100.0 > 0.0) {
+        // Past a trillion dollars the number is not a cost, it is bad input.
+        if (std.math.isFinite(cost) and cost < 1e12 and @round(cost * 100.0) / 100.0 > 0.0) {
             try line.seg();
             try line.color("92", try formatCost(arena, cost));
         }
     }
 
     // --- lines added / removed ---
-    const added: i64 = @intFromFloat(numAt(root, &.{ "cost", "total_lines_added" }) orelse 0);
-    const removed: i64 = @intFromFloat(numAt(root, &.{ "cost", "total_lines_removed" }) orelse 0);
+    const added = whole(numAt(root, &.{ "cost", "total_lines_added" })) orelse 0;
+    const removed = whole(numAt(root, &.{ "cost", "total_lines_removed" })) orelse 0;
     if (added > 0 or removed > 0) {
         try line.seg();
         try line.color("32", try std.fmt.allocPrint(arena, "+{d}", .{added}));
@@ -470,10 +503,10 @@ fn render(
     }
 
     // --- session duration ---
-    if (numAt(root, &.{ "cost", "total_duration_ms" })) |ms| {
+    if (whole(numAt(root, &.{ "cost", "total_duration_ms" }))) |ms| {
         if (ms > 0) {
             try line.seg();
-            try line.color("90", try formatDuration(arena, @intFromFloat(ms)));
+            try line.color("90", try formatDuration(arena, ms));
         }
     }
 
@@ -506,13 +539,13 @@ fn collectQuota(root: std.json.Value, buf: []quota_mod.Window, now: i64) Quota {
     if (h5 != null or d7 != null) {
         buf[0] = .{
             .name = "5h",
-            .pct = roundOr(h5),
-            .reset = roundOr(numAt(root, &.{ "rate_limits", "five_hour", "resets_at" })),
+            .pct = pctOr(h5),
+            .reset = resetOr(numAt(root, &.{ "rate_limits", "five_hour", "resets_at" })),
         };
         buf[1] = .{
             .name = "7d",
-            .pct = roundOr(d7),
-            .reset = roundOr(numAt(root, &.{ "rate_limits", "seven_day", "resets_at" })),
+            .pct = pctOr(d7),
+            .reset = resetOr(numAt(root, &.{ "rate_limits", "seven_day", "resets_at" })),
         };
         return .{ .source = "claude", .windows = buf[0..2] };
     }
@@ -530,12 +563,12 @@ fn collectQuota(root: std.json.Value, buf: []quota_mod.Window, now: i64) Quota {
                     break :blk (1.0 - remaining) * 100.0;
                 };
                 if (!std.math.isFinite(used) or used < 0 or used > 100) continue;
-                var reset = roundOr(numAt(e.value_ptr.*, &.{"reset_time"}));
+                var reset = resetOr(numAt(e.value_ptr.*, &.{"reset_time"}));
                 // A countdown is as good as a timestamp once it is anchored, and
                 // the log only ever stores the absolute form.
                 if (reset == quota_mod.absent) {
-                    if (numAt(e.value_ptr.*, &.{"reset_in_seconds"})) |s| {
-                        reset = now + @as(i64, @intFromFloat(@round(s)));
+                    if (whole(numAt(e.value_ptr.*, &.{"reset_in_seconds"}))) |s| {
+                        if (s >= 0) reset = now + s;
                     }
                 }
                 buf[n] = .{
@@ -564,9 +597,8 @@ fn collectQuota(root: std.json.Value, buf: []quota_mod.Window, now: i64) Quota {
 }
 
 fn quotaSeg(arena: std.mem.Allocator, line: *Line, now: i64, w: quota_mod.Window, glyph: ?pace.Glyph) !void {
-    const p = if (w.pct == quota_mod.absent) 0 else w.pct;
-    const code: []const u8 = if (p > 80) "31" else "33";
-    try line.color(code, try std.fmt.allocPrint(arena, "{d}%", .{p}));
+    const code: []const u8 = if (w.pct > 80) "31" else "33";
+    try line.color(code, try std.fmt.allocPrint(arena, "{d}%", .{w.pct}));
     if (glyph) |g| {
         // Plain glyphs are a glance; the two warnings have to pull the eye, and
         // in different colors, since they ask for opposite things.
@@ -644,12 +676,12 @@ fn timeLeft(arena: std.mem.Allocator, now: i64, unix: i64) ?[]const u8 {
 /// Always ASCII, never locale-dependent, so it looks the same on any machine.
 fn formatCost(arena: std.mem.Allocator, cost: f64) ![]const u8 {
     const cents: i64 = @intFromFloat(@round(cost * 100.0));
-    const whole = @divTrunc(cents, 100);
+    const dollars = @divTrunc(cents, 100);
     // Unsigned: a zero-filled signed value formats with an explicit '+' sign.
     const frac: u64 = @intCast(@rem(cents, 100));
 
     var digits: [32]u8 = undefined;
-    const d = try std.fmt.bufPrint(&digits, "{d}", .{whole});
+    const d = try std.fmt.bufPrint(&digits, "{d}", .{dollars});
 
     var buf: [48]u8 = undefined;
     var n: usize = 0;
@@ -704,8 +736,9 @@ fn localHhMm(arena: std.mem.Allocator, io: Io) ![]const u8 {
     }
     // Elsewhere this is UTC: printing local time would mean carrying a timezone
     // database for two digits, and the platform this targets is handled above.
-    const secs = @mod(cache.nowSeconds(io), 86400);
-    return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}", .{ @divTrunc(secs, 3600), @divTrunc(@rem(secs, 3600), 60) });
+    // Unsigned before zero-filling: a signed value would print as `+05`.
+    const secs: u64 = @intCast(@mod(cache.nowSeconds(io), 86400));
+    return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}", .{ secs / 3600, secs % 3600 / 60 });
 }
 
 /// Where the dirty cache lives. Falls back to the current directory rather than
@@ -736,10 +769,26 @@ fn quotaDir(arena: std.mem.Allocator, env: *std.process.Environ.Map) []const u8 
     return std.fmt.allocPrint(arena, "{s}{c}gaze", .{ base, std.fs.path.sep }) catch ".";
 }
 
-/// A payload number as a whole integer, or `quota_mod.absent` when it is missing.
-fn roundOr(v: ?f64) i64 {
-    const n = v orelse return quota_mod.absent;
+/// A payload number rounded to an integer, or null when it is missing, not
+/// finite, or too large to be anything real. Every float from the payload goes
+/// through here before an integer cast: an out-of-range `@intFromFloat` is
+/// undefined behaviour in ReleaseFast, not an error.
+fn whole(v: ?f64) ?i64 {
+    const n = v orelse return null;
+    if (!std.math.isFinite(n) or @abs(n) > 1e15) return null;
     return @intFromFloat(@round(n));
+}
+
+/// A used percentage, or `quota_mod.absent` when it is missing or off the scale.
+fn pctOr(v: ?f64) i64 {
+    const n = whole(v) orelse return quota_mod.absent;
+    return if (n < 0 or n > 100) quota_mod.absent else n;
+}
+
+/// A reset timestamp, or `quota_mod.absent` when it is missing or not positive.
+fn resetOr(v: ?f64) i64 {
+    const n = whole(v) orelse return quota_mod.absent;
+    return if (n <= 0) quota_mod.absent else n;
 }
 
 // ------------------------------------------------------------ small helpers
@@ -931,6 +980,67 @@ test "collectQuota skips a bucket that says nothing about what is left" {
     const q = try testQuota(a.allocator(), "{\"quota\":{\"broken\":{\"reset_time\":1790000000},\"fast\":{\"remaining_fraction\":0.1}}}", &buf, 1000);
     try std.testing.expectEqual(@as(usize, 1), q.windows.len);
     try std.testing.expectEqualStrings("fast", q.windows[0].name);
+}
+
+test "collectQuota treats absurd numbers as missing rather than casting them" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    var buf: [quota_mod.max_windows]quota_mod.Window = undefined;
+    const q = try testQuota(a.allocator(), "{\"rate_limits\":{\"five_hour\":{\"used_percentage\":1e300,\"resets_at\":-5},\"seven_day\":{\"used_percentage\":140,\"resets_at\":1e300}}}", &buf, 1000);
+    try std.testing.expectEqual(quota_mod.absent, q.windows[0].pct);
+    try std.testing.expectEqual(quota_mod.absent, q.windows[0].reset);
+    try std.testing.expectEqual(quota_mod.absent, q.windows[1].pct);
+    try std.testing.expectEqual(quota_mod.absent, q.windows[1].reset);
+    const agy = try testQuota(a.allocator(), "{\"quota\":{\"fast\":{\"remaining_fraction\":0.5,\"reset_in_seconds\":1e300}}}", &buf, 1000);
+    try std.testing.expectEqual(quota_mod.absent, agy.windows[0].reset);
+}
+
+/// Render a payload with every disk- and process-touching segment off.
+fn testRender(arena: std.mem.Allocator, json: []const u8, env: *std.process.Environ.Map) ![]const u8 {
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, json, .{});
+    const buf = try arena.alloc(u8, 4096);
+    var w: Io.Writer = .fixed(buf);
+    var line: Line = .{ .w = &w };
+    try render(arena, std.testing.io, &line, parsed.value, .{
+        .check_dirty = false,
+        .check_hoot = false,
+        .quota_log = false,
+        .peers = false,
+        .pace = false,
+    }, env);
+    return w.buffered();
+}
+
+test "render omits a Claude window the payload gave no level for" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    var env: std.process.Environ.Map = .init(a.allocator());
+    const out = try testRender(a.allocator(), "{\"model\":{\"display_name\":\"M\"},\"rate_limits\":{\"seven_day\":{\"used_percentage\":47}}}", &env);
+    try std.testing.expect(std.mem.indexOf(u8, out, "47%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "0%") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, " / ") == null);
+}
+
+test "render keeps payload text from reaching the terminal as controls" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    var env: std.process.Environ.Map = .init(a.allocator());
+    try env.put("NIX_ALIAS", "a\x1b]0;x\x07");
+    const out = try testRender(a.allocator(), "{\"cwd\":\"C:/x\\ny\",\"model\":{\"display_name\":\"M\\u001b[2J\\u009b1m\"}}", &env);
+    try std.testing.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, out, 0x07) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\xc2\x9b") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "C:/x?y") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "M?[2J?1m") != null);
+    // gaze's own coloring still gets through.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[35m") != null);
+}
+
+test "writeClean leaves ordinary UTF-8 alone" {
+    var buf: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try writeClean(&w, "caf\xc3\xa9 \xc2\xa0\u{1F989}");
+    try std.testing.expectEqualStrings("caf\xc3\xa9 \xc2\xa0\u{1F989}", w.buffered());
 }
 
 test "collectQuota reports nothing when the payload carries no quota" {
