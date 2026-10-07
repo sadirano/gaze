@@ -92,9 +92,10 @@ distinction is load-bearing:
 - **`codex_peek.zig` - read what the tool already wrote.** Codex records
   `rate_limits` into its own session rollouts, so gaze reads the tail of the
   newest one. No spawn, no request, and the sample is filed under the record's
-  own `timestamp` (the file's mtime when it has none), never the render time,
-  so an old transcript stays old. A sample no newer than the log's last line is
-  dropped. This is the only route the render path may take, and even it sits behind `cache.zig`
+  own `timestamp`, never the render time, so an old transcript stays old. A
+  record without one is skipped (mtime moves with every later append). A
+  sample no newer than the log's last line is dropped, checked under the state
+  lock. This is the only route the render path may take, and even it sits behind `cache.zig`
   (`--codex-ttl`) because the walk costs ~1ms.
 - **`codex_quota.zig` - ask the tool.** A spawn plus a daemon round trip.
   Authoritative and on demand, and **never callable from a render**. `main.zig`
