@@ -11,6 +11,9 @@ test = "zig build test"
 codex-quota = "gaze codex-quota {args}"
 codex-quota-watch = ":codex-quota --watch {args}"
 
+# Before/after measure of weekly points per 5h point: `set` marks, bare reports.
+quota-mark = "python -I scripts/quota_mark.py {args}"
+
 # Globally runnable via ~/.nix/bin (installed by `nix --sync-bin`).
 [bin]
 gaze = "zig-out/bin/gaze.exe"
