@@ -35,8 +35,11 @@ pub fn find(arena: std.mem.Allocator, io: Io, start: []const u8) ?Repo {
 
         // The ordinary case: `.git` is a directory, so `.git/HEAD` reads. Trying
         // the read directly is one syscall instead of an openDir plus a read.
-        if (readHead(arena, io, dot_git)) |b| {
-            return .{ .git_dir = dot_git, .work_dir = dir, .branch = b };
+        // Once HEAD reads, this is the repo, even if its content is malformed:
+        // that is no branch, never the branch of a repo further up.
+        const head_path = std.fs.path.join(arena, &.{ dot_git, "HEAD" }) catch return null;
+        if (readSmall(arena, io, head_path)) |content| {
+            return .{ .git_dir = dot_git, .work_dir = dir, .branch = parseHead(content) };
         }
 
         // `.git` as a FILE: "gitdir: <path>", how worktrees and submodules point
@@ -53,6 +56,10 @@ pub fn find(arena: std.mem.Allocator, io: Io, start: []const u8) ?Repo {
                 std.fs.path.join(arena, &.{ dir, raw }) catch return null;
             return .{ .git_dir = resolved, .work_dir = dir, .branch = readHead(arena, io, resolved) };
         }
+
+        // A `.git` that exists but could not be read either way is still the
+        // nearest repo. Walking past it would show an enclosing repo's branch.
+        if (Io.Dir.cwd().statFile(io, dot_git, .{})) |_| return null else |_| {}
 
         const parent = std.fs.path.dirname(dir) orelse return null;
         if (parent.len == dir.len) return null; // reached the root
@@ -80,7 +87,13 @@ fn parseHead(content: []const u8) ?[]const u8 {
     if (trimmed.len == 0) return null;
 
     const ref_prefix = "ref:";
-    if (!std.mem.startsWith(u8, trimmed, ref_prefix)) return "detached";
+    if (!std.mem.startsWith(u8, trimmed, ref_prefix)) {
+        // Detached only when it really is an object id (SHA-1 or SHA-256);
+        // anything else is a HEAD this does not understand.
+        if (trimmed.len != 40 and trimmed.len != 64) return null;
+        for (trimmed) |c| if (!std.ascii.isHex(c)) return null;
+        return "detached";
+    }
 
     const ref = std.mem.trim(u8, trimmed[ref_prefix.len..], " \t\r\n");
     const heads = "refs/heads/";
@@ -103,6 +116,39 @@ test "parseHead reads a normal ref" {
 
 test "parseHead reports detached for a raw commit id" {
     try std.testing.expectEqualStrings("detached", parseHead("9fceb02f1a3b4c5d6e7f8091a2b3c4d5e6f70819\n").?);
+}
+
+test "parseHead refuses content that is neither a ref nor an object id" {
+    try std.testing.expect(parseHead("garbage\n") == null);
+    try std.testing.expect(parseHead("9fceb02f1a3b\n") == null);
+    try std.testing.expect(parseHead("zfceb02f1a3b4c5d6e7f8091a2b3c4d5e6f70819\n") == null);
+}
+
+test "find stops at a broken nested repo instead of borrowing the outer branch" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const g = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    try tmp.dir.createDirPath(io, ".git");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "ref: refs/heads/outer\n" });
+
+    // Inner `.git` with no HEAD at all: no repo, not the outer one.
+    try tmp.dir.createDirPath(io, "empty/.git");
+    try std.testing.expect(find(g, io, try std.fs.path.join(g, &.{ root, "empty" })) == null);
+
+    // Inner HEAD that does not parse: this repo, no branch.
+    try tmp.dir.createDirPath(io, "bad/.git");
+    try tmp.dir.writeFile(io, .{ .sub_path = "bad/.git/HEAD", .data = "garbage\n" });
+    const bad = find(g, io, try std.fs.path.join(g, &.{ root, "bad" })).?;
+    try std.testing.expect(bad.branch == null);
+
+    // And a plain subdirectory still finds the outer repo.
+    try tmp.dir.createDirPath(io, "plain/sub");
+    try std.testing.expectEqualStrings("outer", find(g, io, try std.fs.path.join(g, &.{ root, "plain", "sub" })).?.branch.?);
 }
 
 test "parseHead keeps slashes in a branch name" {
