@@ -44,6 +44,8 @@ const usage =
     \\  --source <name>        file the quota samples under this tool's name
     \\                         instead of the one inferred from the payload
     \\  --no-peers             do not show how much the other tools have used
+    \\  --peer-pace            also show each other tool's weekly pace glyph
+    \\                         (off by default; GAZE_PEER_PACE=1 turns it on)
     \\  --codex-ttl <seconds>  how often to re-read Codex's transcripts
     \\                         (default 60; 0 re-reads on every render)
     \\  --pace-ttl <seconds>   how often to re-learn pace inputs from the log
@@ -67,7 +69,9 @@ const usage =
     \\A tool metering several independent allowances reports its least-used one
     \\and names it - `Ag33%` is Antigravity's Gemini tier at 33% used, `Ac` its
     \\third-party one - so the number says which model setting would actually
-    \\receive the work.
+    \\receive the work. With --peer-pace the number is followed by the weekly
+    \\pace glyph of that allowance, from its log: `X33%--` means Codex's week
+    \\will reset with quota unspent unless work goes there.
     \\
     \\A window past its reset reads as 0% (what was spent since is unknown); a
     \\sample older than 30 minutes is marked `~`. Codex is nobody's status line, so
@@ -135,6 +139,9 @@ const Config = struct {
     /// Show what the other tools have left, and keep Codex's log current from
     /// its own transcripts.
     peers: bool = true,
+    /// Also show each peer's weekly pace glyph. Opt-in: it costs a log tail
+    /// read per peer, and the peers are meant to stay a glance by default.
+    peer_pace: bool = false,
     codex_ttl_s: u32 = default_codex_ttl_s,
     pace: bool = true,
     pace_ttl_s: u32 = default_pace_ttl_s,
@@ -199,6 +206,7 @@ fn parseArgs(
     if (envTtl(env, "GAZE_CODEX_TTL")) |n| cfg.codex_ttl_s = n;
     if (envTtl(env, "GAZE_PACE_TTL")) |n| cfg.pace_ttl_s = n;
     if (env.get("GAZE_HOOT")) |v| cfg.check_hoot = std.mem.eql(u8, std.mem.trim(u8, v, " \t"), "1");
+    if (env.get("GAZE_PEER_PACE")) |v| cfg.peer_pace = std.mem.eql(u8, std.mem.trim(u8, v, " \t"), "1");
     if (env.get("GAZE_SOURCE")) |s| {
         const t = std.mem.trim(u8, s, " \t");
         if (t.len > 0) cfg.source = t;
@@ -223,6 +231,10 @@ fn parseArgs(
         }
         if (std.mem.eql(u8, a, "--no-quota-log")) {
             cfg.quota_log = false;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--peer-pace")) {
+            cfg.peer_pace = true;
             continue;
         }
         if (std.mem.eql(u8, a, "--no-peers")) {
@@ -476,6 +488,11 @@ fn render(
                 if (level.stale) "~" else "",
                 level.pct,
             }));
+            if (cfg.peer_pace and cfg.pace) {
+                if (peerGlyph(arena, io, quota_dir, tmpDir(env), peer.source, level.group, cfg.pace_ttl_s, pace.hoursFrom(env.get("QUOTA_ACTIVE_HOURS")), now)) |g| {
+                    try line.color(glyphCode(g), g.text());
+                }
+            }
             shown = true;
         }
     }
@@ -608,19 +625,61 @@ fn collectQuota(root: std.json.Value, buf: []quota_mod.Window, now: i64) Quota {
     return .{ .source = "claude", .windows = &.{} };
 }
 
+/// Plain glyphs are a glance; the two warnings have to pull the eye, and in
+/// different colors, since they ask for opposite things.
+fn glyphCode(g: pace.Glyph) []const u8 {
+    return switch (g) {
+        .ahead_warn => "1;31",
+        .behind_warn => "1;36",
+        else => "90",
+    };
+}
+
+/// The weekly pace glyph for the allowance a peer's number names, computed
+/// from the last line of the peer's own log by the same evaluator as this
+/// tool's glyphs. `group` is the allowance the number belongs to ("" when the
+/// peer meters one). Null on any failure, or once the logged weekly window has
+/// reset: nothing is known about the new one.
+///
+/// A stale sample makes the glyph uncertain the same way it makes the number
+/// uncertain, and the number already carries the `~`: the peer can only have
+/// spent more since, so `-` may overstate how far behind it is, while `+` is
+/// at least that far ahead.
+fn peerGlyph(
+    arena: std.mem.Allocator,
+    io: Io,
+    quota_dir: []const u8,
+    tmp_dir: []const u8,
+    source: []const u8,
+    group: []const u8,
+    ttl_s: u32,
+    hours: f64,
+    now: i64,
+) ?pace.Glyph {
+    // One line is a few hundred bytes; this only needs the last.
+    const rows = quota_report.readLogTail(arena, io, quota_dir, source, 4096) catch return null;
+    if (rows.len == 0) return null;
+    const last = rows[rows.len - 1];
+    const offset = quota_report.localOffset();
+    var only: ?pace.Glyph = null;
+    for (quota_report.specs) |spec| {
+        if (!std.mem.eql(u8, spec.tool, source)) continue;
+        const wp = last.fields[spec.weekly] orelse continue;
+        const short: ?pace.Level = if (last.fields[spec.short]) |sp| .{ .used = sp.pct, .reset = sp.reset } else null;
+        var in = pace.cachedInputs(arena, io, quota_dir, tmp_dir, spec, ttl_s, now, offset) orelse continue;
+        in.hours = hours;
+        const r = pace.weekly(in, offset, .{ .used = wp.pct, .reset = wp.reset }, short, now) orelse continue;
+        if (std.mem.eql(u8, quota_mod.groupOf(quota_report.names[spec.weekly]), group)) return r.glyph;
+        if (only == null) only = r.glyph;
+    }
+    // A peer showing one allowance has no group to match: its one glyph is it.
+    return if (group.len == 0) only else null;
+}
+
 fn quotaSeg(arena: std.mem.Allocator, line: *Line, now: i64, w: quota_mod.Window, glyph: ?pace.Glyph) !void {
     const code: []const u8 = if (w.pct > 80) "31" else "33";
     try line.color(code, try std.fmt.allocPrint(arena, "{d}%", .{w.pct}));
-    if (glyph) |g| {
-        // Plain glyphs are a glance; the two warnings have to pull the eye, and
-        // in different colors, since they ask for opposite things.
-        const g_code: []const u8 = switch (g) {
-            .ahead_warn => "1;31",
-            .behind_warn => "1;36",
-            else => "90",
-        };
-        try line.color(g_code, g.text());
-    }
+    if (glyph) |g| try line.color(glyphCode(g), g.text());
     if (w.reset != quota_mod.absent) {
         if (timeLeft(arena, now, w.reset)) |t| {
             try line.color("90", try std.fmt.allocPrint(arena, " {s}", .{t}));
@@ -874,6 +933,41 @@ test "the hoot badge is opt-in, and --no-hoot wins over the environment" {
     try env.put("GAZE_HOOT", "1");
     try std.testing.expect((try parseArgs(a.allocator(), &.{}, &env)).?.check_hoot);
     try std.testing.expect(!(try parseArgs(a.allocator(), &.{"--no-hoot"}, &env)).?.check_hoot);
+}
+
+test "peer pace is opt-in" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    var env: std.process.Environ.Map = .init(a.allocator());
+    try std.testing.expect(!(try parseArgs(a.allocator(), &.{}, &env)).?.peer_pace);
+    try std.testing.expect((try parseArgs(a.allocator(), &.{"--peer-pace"}, &env)).?.peer_pace);
+    try env.put("GAZE_PEER_PACE", "1");
+    try std.testing.expect((try parseArgs(a.allocator(), &.{}, &env)).?.peer_pace);
+}
+
+test "peerGlyph warns about a peer whose week will reset unspent" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const g = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    // A day before its weekly reset, Codex has spent 10%: far more is left
+    // than the remaining 5h windows can use.
+    const now: i64 = 1790000000;
+    const line = try std.fmt.allocPrint(g, "{d}\t5h=0@{d}\t7d=10@{d}\n", .{ now - 60, now + 3600, now + 86400 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "quota-codex.log", .data = line });
+    try std.testing.expectEqual(@as(?pace.Glyph, .behind_warn), peerGlyph(g, io, dir, dir, "codex", "", 0, 24, now));
+
+    // Once the logged week has reset, nothing is known about the new one.
+    const old = try std.fmt.allocPrint(g, "{d}\t7d=10@{d}\n", .{ now - 90000, now - 100 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "quota-codex.log", .data = old });
+    try std.testing.expectEqual(@as(?pace.Glyph, null), peerGlyph(g, io, dir, dir, "codex", "", 0, 24, now));
+
+    // A peer that never reported has no glyph either.
+    try std.testing.expectEqual(@as(?pace.Glyph, null), peerGlyph(g, io, dir, dir, "agy", "gemini", 0, 24, now));
 }
 
 test "relativeToAlias strips the root" {

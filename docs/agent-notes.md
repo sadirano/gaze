@@ -144,7 +144,9 @@ from another process is stale by construction, so two rules keep it from
 lying: a window past its `reset` reads as 0% (a floor: whatever was spent since
 is unknown), and a sample older than `stale_after_s` is marked `~`. The number
 is percentage USED, and a tool with several independent allowances shows its
-least-used one. If you add a third display rule, make
+least-used one. `--peer-pace` adds that allowance's weekly glyph, through the
+same `pace.weekly` and `pace.cachedInputs` as the own tool's, never a copy.
+If you add a third display rule, make
 sure it also fails towards "say less" rather than "guess".
 
 ## Changing the rendered line

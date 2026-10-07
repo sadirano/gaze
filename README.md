@@ -145,6 +145,7 @@ is a single short file, so it is always current and effectively free.
 --source <name>         file quota samples under this tool's name instead of
                         the one inferred from the payload
 --no-peers              do not show how much the other tools have used
+--peer-pace             also show each other tool's weekly pace glyph (off by default)
 --pace-ttl <seconds>    how often to re-learn pace inputs from the log
                         (default 600; 0 = every render)
 --no-pace               drop the pace glyphs
@@ -154,8 +155,8 @@ is a single short file, so it is always current and effectively free.
 ```
 
 `GAZE_DIRTY_TTL`, `GAZE_HOOT_TTL`, `GAZE_CODEX_TTL`, `GAZE_PACE_TTL` and
-`GAZE_SOURCE` set the same intervals and name, and `GAZE_HOOT=1` turns the hoot
-badge on; flags win. Both `--dirty-ttl 5` and `--dirty-ttl=5` are accepted, the
+`GAZE_SOURCE` set the same intervals and name; `GAZE_HOOT=1` turns the hoot
+badge on and `GAZE_PEER_PACE=1` the peer pace glyphs; flags win. Both `--dirty-ttl 5` and `--dirty-ttl=5` are accepted, the
 latter because it reads better inside a `settings.json` command string.
 
 Turning the dirty check off (`--no-dirty`) renders in 7.0ms - the same as
@@ -243,6 +244,23 @@ number as a current one is the failure this project refuses:
   was spent since is unknown, so treat it as a floor.
 - **Anything older than 30 minutes renders `~98%`**, because the tool has not
   reported since and nobody knows what it did meanwhile.
+
+### Their pace, too
+
+`--peer-pace` (or `GAZE_PEER_PACE=1`) follows each peer's number with the weekly
+pace glyph of that allowance, computed from its log by the same evaluator as
+this tool's own glyphs:
+
+```
+61% @3h6m / 53%= @139h56m  Ag33%- X12%--
+```
+
+`X12%--` says Codex's week will reset with quota left over unless work goes
+there - worth knowing while working in Claude Code, and more so when it is the
+one handing tasks out. The glyph follows the number's honesty rules: none once
+the logged week has reset, and after a `~` it is as uncertain as the number (the
+peer can only have spent more since, so `-` may overstate how far behind it
+is). `gaze quota` shows the numbers behind every glyph.
 
 `--no-peers` turns the segment off.
 
