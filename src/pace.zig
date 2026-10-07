@@ -211,7 +211,9 @@ pub fn cachedInputs(
     now: i64,
     offset: i64,
 ) ?Inputs {
-    const path = cache.pathFor(a, tmp_dir, "pace", spec.id) catch return null;
+    // The dataset is part of the identity: two quota dirs must not share inputs.
+    const key = std.fmt.allocPrint(a, "{s}\x00{s}", .{ quota_dir, spec.id }) catch return null;
+    const path = cache.pathFor(a, tmp_dir, "pace", key) catch return null;
     if (cache.read(a, io, path, ttl_s, now)) |raw| {
         if (decode(raw)) |in| return in;
     }

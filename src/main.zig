@@ -37,7 +37,8 @@ const usage =
     \\                         (default 10; 0 re-checks on every render)
     \\  --no-dirty             never check git; show the branch alone
     \\  --no-hoot              never check hoot; drop the badge
-    \\  --no-quota-log         do not append quota samples to the log
+    \\  --no-quota-log         write no quota log at all: neither this tool's
+    \\                         samples nor Codex's, read from its transcripts
     \\  --source <name>        file the quota samples under this tool's name
     \\                         instead of the one inferred from the payload
     \\  --no-peers             do not show what the other tools have left
@@ -410,8 +411,9 @@ fn render(
     if (cfg.peers) {
         // Codex is nobody's status line, so its log would go stale on its own.
         // It writes its limits into its session transcripts, though, so keeping
-        // the log current costs a file read rather than a request.
-        if (!std.mem.eql(u8, source, "codex")) {
+        // the log current costs a file read rather than a request. That is a
+        // quota log write, so --no-quota-log stops it too.
+        if (cfg.quota_log and !std.mem.eql(u8, source, "codex")) {
             if (env.get("USERPROFILE") orelse env.get("HOME")) |home| {
                 codex_peek.refresh(arena, io, home, quota_dir, tmpDir(env), cfg.codex_ttl_s, now);
             }

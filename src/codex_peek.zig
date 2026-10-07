@@ -8,13 +8,13 @@
 //! `~/.codex/sessions/<year>/<month>/<day>/rollout-*.jsonl` carries a
 //! `rate_limits` object, and it sits at the tail of the file where a positioned
 //! read finds it. So gaze reads the file instead of asking the daemon - the same
-//! move as taking the branch from `.git/HEAD` rather than running `git`, and the
-//! same move perch makes reading Claude Code's transcripts.
+//! move as taking the branch from `.git/HEAD` rather than running `git`.
 //!
-//! This costs no spawn and no request. It also means an idle Codex is never
-//! polled: when nothing is running, nothing is written, and there is nothing to
-//! ask. The freshness of the answer is exactly the freshness of Codex's own
-//! activity, which is the only thing that can move the number anyway.
+//! This costs no spawn and no request: Codex is never asked anything. The
+//! sample is filed under the time Codex recorded it, not the time gaze read
+//! it, so an hours-old transcript stays hours old in the log and renders `~`.
+//! It shows Codex's activity on this machine only; use elsewhere on the same
+//! account is not visible here.
 //!
 //! The walk is still four directory listings and a 64KB read, which is real next
 //! to a 7ms render, so it sits behind `cache.zig` on its own interval.
@@ -51,22 +51,57 @@ pub fn refresh(
     ttl_s: u32,
     now: i64,
 ) void {
-    const stamp = cache.pathFor(arena, tmp_dir, "codex", home) catch return;
+    // Keyed on both ends: two quota dirs fed from one home must not suppress
+    // each other's refresh.
+    const key = std.fmt.allocPrint(arena, "{s}\x00{s}", .{ home, quota_dir }) catch return;
+    const stamp = cache.pathFor(arena, tmp_dir, "codex", key) catch return;
     if (ttl_s > 0 and cache.read(arena, io, stamp, ttl_s, now) != null) return;
     // Stamp first: a Codex that is installed but has never run would otherwise
     // pay for the whole walk on every single redraw.
     cache.write(io, stamp, "1", now) catch {};
 
-    const windows = sample(arena, io, home) orelse return;
+    const s = sample(arena, io, home) orelse return;
+    // A clock ahead of ours is clamped rather than trusted into the future.
+    const observed = @min(s.observed, now);
+    // Only ever move the log forward: a transcript sample no newer than the
+    // log's last line (an explicit `gaze codex-quota` refresh, say) is old news.
+    if (lastLogTime(arena, io, quota_dir)) |last| if (observed <= last) return;
     quota.record(arena, io, quota_dir, .{
-        .now = now,
+        .now = observed,
         .source = "codex",
-        .windows = windows,
+        .windows = s.windows,
     }, 300);
 }
 
+pub const Sample = struct {
+    windows: []const quota.Window,
+    /// Unix seconds at which Codex recorded it.
+    observed: i64,
+};
+
+/// The timestamp of the last complete line of `quota-codex.log`, if any.
+fn lastLogTime(arena: std.mem.Allocator, io: Io, quota_dir: []const u8) ?i64 {
+    const path = std.fmt.allocPrint(arena, "{s}{c}quota-codex.log", .{ quota_dir, std.fs.path.sep }) catch return null;
+    const file = Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+    const size = (file.stat(io) catch return null).size;
+    var buf: [512]u8 = undefined;
+    const want = @min(size, buf.len);
+    const n = file.readPositionalAll(io, buf[0..@intCast(want)], size - want) catch return null;
+    return lineTime(buf[0..n]);
+}
+
+/// The leading timestamp of the last newline-terminated line in `tail`.
+fn lineTime(tail: []const u8) ?i64 {
+    const end = std.mem.lastIndexOfScalar(u8, tail, '\n') orelse return null;
+    const begin = if (std.mem.lastIndexOfScalar(u8, tail[0..end], '\n')) |i| i + 1 else 0;
+    const line = tail[begin..end];
+    const tab = std.mem.indexOfScalar(u8, line, '\t') orelse line.len;
+    return std.fmt.parseInt(i64, line[0..tab], 10) catch null;
+}
+
 /// The newest quota sample Codex has written, or null when there is none.
-pub fn sample(arena: std.mem.Allocator, io: Io, home: []const u8) ?[]const quota.Window {
+pub fn sample(arena: std.mem.Allocator, io: Io, home: []const u8) ?Sample {
     const sessions = std.fmt.allocPrint(arena, "{s}{c}.codex{c}sessions", .{
         home, std.fs.path.sep, std.fs.path.sep,
     }) catch return null;
@@ -129,31 +164,82 @@ fn greatestFiles(arena: std.mem.Allocator, io: Io, dir: Io.Dir, out: [][]const u
     return n;
 }
 
-fn readSample(arena: std.mem.Allocator, io: Io, dir: Io.Dir, name: []const u8) ?[]const quota.Window {
+fn readSample(arena: std.mem.Allocator, io: Io, dir: Io.Dir, name: []const u8) ?Sample {
     const file = dir.openFile(io, name, .{}) catch return null;
     defer file.close(io);
-    const size = (file.stat(io) catch return null).size;
+    const st = file.stat(io) catch return null;
+    const size = st.size;
 
     const want = @min(size, tail_bytes);
     const buf = arena.alloc(u8, @intCast(want)) catch return null;
     const n = file.readPositionalAll(io, buf, size - want) catch return null;
-    return parseTail(arena, buf[0..n]);
+    const found = parseTail(arena, buf[0..n]) orelse return null;
+    // A record without a readable timestamp falls back to the file's last
+    // write, which is never older than the record itself.
+    const mtime: i64 = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
+    return .{ .windows = found.windows, .observed = found.observed orelse mtime };
 }
 
-/// The windows named by the last complete `rate_limits` object in `tail`.
+pub const Found = struct {
+    windows: []const quota.Window,
+    /// The record's own `timestamp`, when it carried a readable one.
+    observed: ?i64,
+};
+
+/// The windows named by the last complete `rate_limits` object in `tail`, and
+/// the timestamp of the record that holds it.
 ///
 /// Split from disk so the parsing is testable. Walks backwards through markers:
 /// a rollout caught mid-write can end on a truncated object, and the sample
 /// before it is still perfectly good.
-pub fn parseTail(arena: std.mem.Allocator, tail: []const u8) ?[]const quota.Window {
+pub fn parseTail(arena: std.mem.Allocator, tail: []const u8) ?Found {
     var end = tail.len;
     while (std.mem.lastIndexOf(u8, tail[0..end], marker)) |at| {
         end = at;
         const obj = balancedObject(tail[at..]) orelse continue;
         const parsed = std.json.parseFromSlice(std.json.Value, arena, obj, .{}) catch continue;
-        if (mapWindows(arena, parsed.value)) |w| return w;
+        const w = mapWindows(arena, parsed.value) orelse continue;
+        const line_start = if (std.mem.lastIndexOfScalar(u8, tail[0..at], '\n')) |i| i + 1 else 0;
+        return .{ .windows = w, .observed = recordTime(tail[line_start..at]) };
     }
     return null;
+}
+
+/// The `"timestamp":"<ISO 8601 UTC>"` a rollout record opens with, as unix
+/// seconds. Null when the prefix holds none, or one this does not read: the
+/// caller then falls back to the file time rather than guessing.
+fn recordTime(prefix: []const u8) ?i64 {
+    const key = "\"timestamp\":\"";
+    const i = std.mem.indexOf(u8, prefix, key) orelse return null;
+    return parseIsoUtc(prefix[i + key.len ..]);
+}
+
+/// `YYYY-MM-DDTHH:MM:SS[.fff]Z` as unix seconds. Only UTC (`Z`) is accepted.
+fn parseIsoUtc(s: []const u8) ?i64 {
+    if (s.len < 20 or s[4] != '-' or s[7] != '-' or s[10] != 'T' or s[13] != ':' or s[16] != ':') return null;
+    const y = std.fmt.parseInt(i64, s[0..4], 10) catch return null;
+    const mo = std.fmt.parseInt(i64, s[5..7], 10) catch return null;
+    const d = std.fmt.parseInt(i64, s[8..10], 10) catch return null;
+    const h = std.fmt.parseInt(i64, s[11..13], 10) catch return null;
+    const mi = std.fmt.parseInt(i64, s[14..16], 10) catch return null;
+    const se = std.fmt.parseInt(i64, s[17..19], 10) catch return null;
+    var rest = s[19..];
+    if (rest.len > 0 and rest[0] == '.') {
+        var k: usize = 1;
+        while (k < rest.len and std.ascii.isDigit(rest[k])) k += 1;
+        rest = rest[k..];
+    }
+    if (rest.len == 0 or rest[0] != 'Z') return null;
+    if (mo < 1 or mo > 12 or d < 1 or d > 31 or h > 23 or mi > 59 or se > 60) return null;
+    // Days from civil (Howard Hinnant's algorithm), proleptic Gregorian.
+    const yy = if (mo <= 2) y - 1 else y;
+    const era = @divFloor(yy, 400);
+    const yoe = yy - era * 400;
+    const mp = @mod(mo + 9, 12);
+    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    const days = era * 146097 + doe - 719468;
+    return days * 86400 + h * 3600 + mi * 60 + se;
 }
 
 /// The `{...}` following `"rate_limits":`, as a slice.
@@ -239,7 +325,7 @@ fn num(v: ?std.json.Value) ?f64 {
 
 /// A real record, trimmed: the shape Codex writes at the tail of a rollout.
 const real_tail =
-    \\{"type":"turn","payload":{"rate_limits":{"limit_id":"codex","limit_name":null,
+    \\{"timestamp":"2026-09-20T10:00:00.123Z","type":"event_msg","payload":{"rate_limits":{"limit_id":"codex","limit_name":null,
     \\"primary":{"used_percent":95.0,"window_minutes":300,"resets_at":1789943916},
     \\"secondary":{"used_percent":15.0,"window_minutes":10080,"resets_at":1790530716},
     \\"credits":{"has_credits":false,"unlimited":false,"balance":"0"},
@@ -249,7 +335,7 @@ const real_tail =
 test "parseTail reads both windows out of a real record" {
     var a = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer a.deinit();
-    const w = parseTail(a.allocator(), real_tail).?;
+    const w = parseTail(a.allocator(), real_tail).?.windows;
     try std.testing.expectEqual(@as(usize, 2), w.len);
     try std.testing.expectEqualStrings("5h", w[0].name);
     try std.testing.expectEqual(@as(i64, 95), w[0].pct);
@@ -265,7 +351,7 @@ test "parseTail takes the last sample, not the first" {
         \\{"payload":{"rate_limits":{"limit_id":"codex",
         \\"primary":{"used_percent":97.0,"window_minutes":300,"resets_at":1789943916}}}}
     ;
-    const w = parseTail(a.allocator(), two).?;
+    const w = parseTail(a.allocator(), two).?.windows;
     try std.testing.expectEqual(@as(i64, 97), w[0].pct);
 }
 
@@ -276,7 +362,7 @@ test "parseTail falls back past an object truncated mid-write" {
         \\{"payload":{"rate_limits":{"limit_id":"codex","primary":{"used_per
     ;
     // The good sample before the torn one still answers.
-    const w = parseTail(a.allocator(), cut).?;
+    const w = parseTail(a.allocator(), cut).?.windows;
     try std.testing.expectEqual(@as(i64, 95), w[0].pct);
 }
 
@@ -287,7 +373,7 @@ test "parseTail is not fooled by a brace inside a string" {
         \\{"rate_limits":{"limit_id":"codex","limit_name":"a } \" {",
         \\"primary":{"used_percent":12,"window_minutes":300,"resets_at":1}}}
     ;
-    const w = parseTail(a.allocator(), tricky).?;
+    const w = parseTail(a.allocator(), tricky).?.windows;
     try std.testing.expectEqual(@as(i64, 12), w[0].pct);
 }
 
@@ -306,7 +392,7 @@ test "parseTail keeps a window that never says when it resets" {
     const no_reset =
         \\{"rate_limits":{"primary":{"used_percent":40,"window_minutes":300}}}
     ;
-    const w = parseTail(a.allocator(), no_reset).?;
+    const w = parseTail(a.allocator(), no_reset).?.windows;
     try std.testing.expectEqual(@as(i64, 40), w[0].pct);
     try std.testing.expectEqual(quota.absent, w[0].reset);
 }
@@ -316,4 +402,56 @@ test "parseTail finds nothing in a tail that holds no sample" {
     defer a.deinit();
     try std.testing.expect(parseTail(a.allocator(), "{\"type\":\"message\"}") == null);
     try std.testing.expect(parseTail(a.allocator(), "") == null);
+}
+
+test "parseTail carries the record's own time" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    try std.testing.expectEqual(@as(?i64, 1789898400), parseTail(a.allocator(), real_tail).?.observed);
+    // No timestamp in the record: unknown here, and the caller uses the file time.
+    const bare =
+        \\{"rate_limits":{"primary":{"used_percent":40,"window_minutes":300}}}
+    ;
+    try std.testing.expectEqual(@as(?i64, null), parseTail(a.allocator(), bare).?.observed);
+}
+
+test "parseIsoUtc reads UTC and refuses what it cannot be sure of" {
+    try std.testing.expectEqual(@as(?i64, 1789898400), parseIsoUtc("2026-09-20T10:00:00Z"));
+    try std.testing.expectEqual(@as(?i64, 951868799), parseIsoUtc("2000-02-29T23:59:59.999999Z\""));
+    try std.testing.expectEqual(@as(?i64, null), parseIsoUtc("2026-09-20T10:00:00+02:00"));
+    try std.testing.expectEqual(@as(?i64, null), parseIsoUtc("2026-13-20T10:00:00Z"));
+    try std.testing.expectEqual(@as(?i64, null), parseIsoUtc("yesterday"));
+}
+
+test "refresh files a sample under Codex's time and never moves the log back" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const g = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    try tmp.dir.createDirPath(io, ".codex/sessions/2026/09/20");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".codex/sessions/2026/09/20/rollout-2026-09-20T09-00-00-x.jsonl", .data = real_tail ++ "\n" });
+    try tmp.dir.createDirPath(io, "q");
+    const quota_dir = try std.fs.path.join(g, &.{ home, "q" });
+
+    // Read hours later: the line still says when Codex wrote it.
+    const later = 1789898400 + 5 * 3600;
+    refresh(g, io, home, quota_dir, home, 0, later);
+    const log = try tmp.dir.readFileAlloc(io, "q/quota-codex.log", g, .limited(4096));
+    try std.testing.expectEqualStrings("1789898400\t5h=95@1789943916\t7d=15@1790530716\n", log);
+
+    // A newer explicit refresh is already in the log: the transcript is older.
+    try tmp.dir.writeFile(io, .{ .sub_path = "q/quota-codex.log", .data = "1789900000\t5h=96@1789943916\t7d=15@1790530716\n" });
+    refresh(g, io, home, quota_dir, home, 0, later + 60);
+    const kept = try tmp.dir.readFileAlloc(io, "q/quota-codex.log", g, .limited(4096));
+    try std.testing.expectEqualStrings("1789900000\t5h=96@1789943916\t7d=15@1790530716\n", kept);
+}
+
+test "lineTime reads only a complete last line" {
+    try std.testing.expectEqual(@as(?i64, 20), lineTime("10\ta=1\n20\ta=2\n"));
+    try std.testing.expectEqual(@as(?i64, 10), lineTime("10\ta=1\n20\ta="));
+    try std.testing.expectEqual(@as(?i64, null), lineTime(""));
 }
