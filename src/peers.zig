@@ -8,8 +8,9 @@
 //! Two honesty rules, because a status line that shows a stale number as a
 //! current one is the failure this project refuses:
 //!
-//!   * A window past its reset is 0%, known without asking anyone. That is the
-//!     one case where an old sample becomes MORE accurate with age.
+//!   * A window past its reset reads as 0%. The old level certainly ended
+//!     there; whatever was spent since is unknown, so this is a floor rather
+//!     than a measurement, and the `~` below still applies to it.
 //!   * Anything else older than `stale_after_s` renders with a `~`, because the
 //!     tool has not reported since and nobody knows what it did meanwhile.
 
@@ -109,9 +110,12 @@ pub fn read(
 /// The level named by the last complete line of a quota log.
 ///
 /// Split from disk so the rules are testable. A partial first line is expected -
-/// the read starts at a fixed offset from the end, not at a line boundary.
+/// the read starts at a fixed offset from the end, not at a line boundary. A
+/// partial LAST line is possible too, from a writer caught mid-append, so only
+/// a line that ends in a newline counts.
 pub fn parse(tail: []const u8, now: i64) ?Level {
-    const trimmed = std.mem.trimEnd(u8, tail, " \t\r\n");
+    const end = std.mem.lastIndexOfScalar(u8, tail, '\n') orelse return null;
+    const trimmed = std.mem.trimEnd(u8, tail[0..end], " \t\r");
     const begin = if (std.mem.lastIndexOfScalar(u8, trimmed, '\n')) |i| i + 1 else 0;
     var fields = std.mem.splitScalar(u8, trimmed[begin..], '\t');
 
@@ -170,24 +174,24 @@ pub fn parse(tail: []const u8, now: i64) ?Level {
 // ------------------------------------------------------------------- tests
 
 test "parse takes the most used window as the binding one" {
-    const l = parse("1000\t5h=4@9000\t7d=47@9000", 1100).?;
+    const l = parse("1000\t5h=4@9000\t7d=47@9000\n", 1100).?;
     try std.testing.expectEqual(@as(i64, 47), l.pct);
     try std.testing.expect(!l.stale);
     try std.testing.expectEqualStrings("", l.group);
 }
 
 test "parse reports the emptiest allowance when a tool meters several" {
-    // Antigravity as measured on 2026-09-20: its Claude bucket is spent and its
-    // Gemini bucket is untouched. Reporting 100 would send work away from a tool
-    // with a completely free window.
-    const l = parse("1000\t3p-5h=100@9000\t3p-weekly=33@9000\tgemini-5h=0@9000\tgemini-weekly=33@9000", 1100).?;
+    // Antigravity with its Claude bucket spent and its Gemini bucket untouched.
+    // Reporting 100 would send work away from a tool with a completely free
+    // window.
+    const l = parse("1000\t3p-5h=100@9000\t3p-weekly=33@9000\tgemini-5h=0@9000\tgemini-weekly=33@9000\n", 1100).?;
     try std.testing.expectEqual(@as(i64, 33), l.pct);
     // Naming the open door is the point: it says which model setting takes work.
     try std.testing.expectEqualStrings("gemini", l.group);
 }
 
 test "parse still binds on the fullest window inside one allowance" {
-    const l = parse("1000\t3p-5h=100@9000\t3p-weekly=20@9000", 1100).?;
+    const l = parse("1000\t3p-5h=100@9000\t3p-weekly=20@9000\n", 1100).?;
     try std.testing.expectEqual(@as(i64, 100), l.pct);
     // One allowance metered two ways is not a choice between doors.
     try std.testing.expectEqualStrings("", l.group);
@@ -198,29 +202,34 @@ test "parse reads the last line when the read began mid-line" {
     try std.testing.expectEqual(@as(i64, 30), parse(torn, 2100).?.pct);
 }
 
+test "parse ignores a last line still being written" {
+    try std.testing.expectEqual(@as(i64, 30), parse("2000\t5h=30@9000\n2100\t5h=9", 2100).?.pct);
+    try std.testing.expect(parse("2000\t5h=30@9000", 2100) == null);
+}
+
 test "parse treats a window past its reset as empty" {
     // 95% five-hour, but the reset has been and gone: it is 0 now, and the
     // seven-day window at 15% becomes the binding one.
-    const l = parse("1000\t5h=95@1500\t7d=15@99999", 2000).?;
+    const l = parse("1000\t5h=95@1500\t7d=15@99999\n", 2000).?;
     try std.testing.expectEqual(@as(i64, 15), l.pct);
 }
 
 test "parse keeps a window whose reset has not arrived" {
-    const l = parse("1000\t5h=95@3000\t7d=15@99999", 2000).?;
+    const l = parse("1000\t5h=95@3000\t7d=15@99999\n", 2000).?;
     try std.testing.expectEqual(@as(i64, 95), l.pct);
 }
 
 test "parse marks an old sample stale" {
-    try std.testing.expect(parse("1000\t5h=40", 1000 + stale_after_s + 1).?.stale);
-    try std.testing.expect(!parse("1000\t5h=40", 1000 + stale_after_s).?.stale);
+    try std.testing.expect(parse("1000\t5h=40\n", 1000 + stale_after_s + 1).?.stale);
+    try std.testing.expect(!parse("1000\t5h=40\n", 1000 + stale_after_s).?.stale);
     // A clock that moved backwards is not a fresh sample either.
-    try std.testing.expect(parse("2000\t5h=40", 1000).?.stale);
+    try std.testing.expect(parse("2000\t5h=40\n", 1000).?.stale);
 }
 
 test "parse ignores a window with no usable percentage" {
-    try std.testing.expect(parse("1000\t5h=abc", 1000) == null);
-    try std.testing.expect(parse("1000\t5h=140", 1000) == null);
-    try std.testing.expect(parse("1000", 1000) == null);
+    try std.testing.expect(parse("1000\t5h=abc\n", 1000) == null);
+    try std.testing.expect(parse("1000\t5h=140\n", 1000) == null);
+    try std.testing.expect(parse("1000\n", 1000) == null);
     try std.testing.expect(parse("", 1000) == null);
 }
 

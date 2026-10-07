@@ -20,9 +20,11 @@
 //!     and `ls quota-*.log` answers "which tools have ever reported".
 //!
 //! Writes are deduped through a per-source state file: a sample lands only when
-//! some window's percentage has moved or `min_interval_s` has elapsed, so an
-//! idle redraw loop writes nothing and a busy one writes at most one line per
-//! percentage point.
+//! some window's percentage or reset has moved, or `min_interval_s` has
+//! elapsed. A busy session writes about one line per percentage point; a redraw
+//! loop that keeps running while nothing is spent still writes one heartbeat
+//! line per interval, so the log grows for as long as renders continue. Nothing
+//! here rotates it.
 //!
 //! Per gaze's one invariant, every failure here is silent. A log that cannot be
 //! written costs a gap in history; it must never cost a status line.
@@ -87,9 +89,15 @@ pub fn formatLine(buf: []u8, s: Sample) ![]const u8 {
     return buf[0 .. n + 1];
 }
 
-/// The part of a sample that decides whether it is worth writing: the window
-/// names and their percentages, without the reset timestamps. Resets are
-/// absolute and would otherwise force a write every time one is re-stated.
+/// How far a reset may drift before it counts as moved. A countdown such as
+/// Antigravity's `reset_in_seconds` is anchored to the render clock, so the same
+/// reset re-stated a second later lands a second later; a reset that really
+/// moved (a new window) moves by hours.
+pub const reset_tolerance_s: i64 = 120;
+
+/// The part of a sample that decides whether it is worth writing: each window's
+/// name, percentage and reset, as `name=pct@reset` separated by spaces.
+/// `shouldWrite` compares resets with `reset_tolerance_s` of slack.
 pub fn stateKey(buf: []u8, s: Sample) ![]const u8 {
     var n: usize = 0;
     for (s.windows, 0..) |w, i| {
@@ -101,6 +109,7 @@ pub fn stateKey(buf: []u8, s: Sample) ![]const u8 {
         }
         n += (try writeName(buf[n..], w.name)).len;
         n += (try std.fmt.bufPrint(buf[n..], "={d}", .{w.pct})).len;
+        if (w.reset != absent) n += (try std.fmt.bufPrint(buf[n..], "@{d}", .{w.reset})).len;
     }
     return buf[0..n];
 }
@@ -133,10 +142,15 @@ pub fn writeName(buf: []u8, name: []const u8) ![]const u8 {
 /// budget the way Claude Code's `5h` and `7d` are, so anything that reduces a
 /// tool to a single number has to know which windows bind together.
 ///
-/// The convention is `<group>-<window>`: everything before the last `-`. A name
-/// without one, like `5h`, belongs to no group and is its own allowance.
+/// The convention is `<group>-<window>` or `<group>.<window>`: everything
+/// before the last `-` or `.`, whichever comes later. Antigravity spells its
+/// buckets `gemini-5h`; Codex spells an additional bucket `fast.5h`, because
+/// its bucket ids may themselves contain dashes. A name with neither, like `5h`,
+/// belongs to no group and is its own allowance.
 pub fn groupOf(name: []const u8) []const u8 {
-    const cut = std.mem.lastIndexOfScalar(u8, name, '-') orelse return "";
+    const dash = std.mem.lastIndexOfScalar(u8, name, '-');
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.');
+    const cut = if (dash != null and dot != null) @max(dash.?, dot.?) else dash orelse dot orelse return "";
     return name[0..cut];
 }
 
@@ -152,15 +166,36 @@ pub fn shouldWrite(state: ?[]const u8, now: i64, key: []const u8, min_interval_s
     const tab = std.mem.indexOfScalar(u8, content, '\t') orelse return true;
     const ts = std.fmt.parseInt(i64, std.mem.trim(u8, content[0..tab], " \r\n"), 10) catch return true;
 
-    // A moved percentage is the event worth recording, in any window, so never
-    // suppress it. A window appearing or disappearing moves the key too.
-    if (!std.mem.eql(u8, std.mem.trim(u8, content[tab + 1 ..], " \t\r\n"), key)) return true;
+    // A moved percentage or reset is the event worth recording, in any window,
+    // so never suppress it. A window appearing or disappearing moves the key too.
+    if (!sameKey(std.mem.trim(u8, content[tab + 1 ..], " \t\r\n"), key)) return true;
 
     const age = now - ts;
     // A negative age means the clock moved backwards. Write, so the log resyncs
     // rather than going quiet until the old timestamp is overtaken.
     if (age < 0) return true;
     return age >= min_interval_s;
+}
+
+/// Whether two state keys name the same windows at the same percentages, with
+/// resets equal to within `reset_tolerance_s`. A reset present in one key and
+/// absent from the other is a difference.
+fn sameKey(old: []const u8, new: []const u8) bool {
+    var a = std.mem.splitScalar(u8, old, ' ');
+    var b = std.mem.splitScalar(u8, new, ' ');
+    while (true) {
+        const x = a.next();
+        const y = b.next();
+        if (x == null or y == null) return x == null and y == null;
+        const xa = std.mem.indexOfScalar(u8, x.?, '@');
+        const ya = std.mem.indexOfScalar(u8, y.?, '@');
+        if (!std.mem.eql(u8, x.?[0 .. xa orelse x.?.len], y.?[0 .. ya orelse y.?.len])) return false;
+        if ((xa == null) != (ya == null)) return false;
+        if (xa == null) continue;
+        const xr = std.fmt.parseInt(i64, x.?[xa.? + 1 ..], 10) catch return false;
+        const yr = std.fmt.parseInt(i64, y.?[ya.? + 1 ..], 10) catch return false;
+        if (@abs(xr - yr) > reset_tolerance_s) return false;
+    }
 }
 
 /// Append `s` to `<dir>/quota-<source>.log` unless the dedupe rule says otherwise.
@@ -174,7 +209,7 @@ pub fn record(
     s: Sample,
     min_interval_s: i64,
 ) void {
-    var key_buf: [max_windows * (max_name_len + 8)]u8 = undefined;
+    var key_buf: [max_windows * (max_name_len + 32)]u8 = undefined;
     const key = stateKey(&key_buf, s) catch return;
     // Nothing to record: a payload with no usable window is the one case where a
     // sample would be pure noise.
@@ -186,15 +221,33 @@ pub fn record(
     const log_path = std.fmt.allocPrint(arena, "{s}{c}quota-{s}.log", .{ dir, std.fs.path.sep, src }) catch return;
     const state_path = std.fmt.allocPrint(arena, "{s}{c}quota-{s}.state", .{ dir, std.fs.path.sep, src }) catch return;
 
-    const state = Io.Dir.cwd().readFileAlloc(io, state_path, arena, .limited(512)) catch null;
+    const state = Io.Dir.cwd().readFileAlloc(io, state_path, arena, .limited(1024)) catch null;
     if (!shouldWrite(state, s.now, key, min_interval_s)) return;
 
     // Only now is the directory worth creating - the common path touches nothing.
     Io.Dir.cwd().createDirPath(io, dir) catch {};
 
+    // The state file doubles as the lock. Several renders (and a collector) can
+    // decide to write at the same moment; holding it across the re-check, the
+    // append and the state update means one of them writes and the others see
+    // its state and stand down, instead of two positioned writes landing on the
+    // same offset. Never wait for it: whoever holds it is writing a sample now.
+    const lock = Io.Dir.cwd().createFile(io, state_path, .{
+        .truncate = false,
+        .read = true,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    }) catch return;
+    defer lock.close(io);
+    var held_buf: [key_buf.len + 32]u8 = undefined;
+    const held_n = lock.readPositionalAll(io, &held_buf, 0) catch return;
+    // An empty state file is one this call just created: no state.
+    const held: ?[]const u8 = if (held_n == 0) null else held_buf[0..held_n];
+    if (!shouldWrite(held, s.now, key, min_interval_s)) return;
+
     // No state means this is the first line this source has ever written, which
     // is the one moment a pre-source log can still be sitting there unnamed.
-    if (state == null) retireUnsourcedLog(arena, io, dir);
+    if (held == null) retireUnsourcedLog(arena, io, dir);
 
     var line_buf: [512]u8 = undefined;
     const line = formatLine(&line_buf, s) catch return;
@@ -204,7 +257,8 @@ pub fn record(
     // duplicate line rather than a lost one.
     var state_buf: [key_buf.len + 32]u8 = undefined;
     const state_line = std.fmt.bufPrint(&state_buf, "{d}\t{s}", .{ s.now, key }) catch return;
-    Io.Dir.cwd().writeFile(io, .{ .sub_path = state_path, .data = state_line }) catch {};
+    lock.writePositionalAll(io, state_line, 0) catch return;
+    lock.setLength(io, state_line.len) catch {};
 }
 
 /// Move a log written before sources existed out of the way, once.
@@ -219,12 +273,15 @@ fn retireUnsourcedLog(arena: std.mem.Allocator, io: Io, dir: []const u8) void {
     const old_log = std.fmt.allocPrint(arena, "{s}{c}quota.log", .{ dir, std.fs.path.sep }) catch return;
     const new_log = std.fmt.allocPrint(arena, "{s}{c}quota-v1.log", .{ dir, std.fs.path.sep }) catch return;
     const old_state = std.fmt.allocPrint(arena, "{s}{c}quota.state", .{ dir, std.fs.path.sep }) catch return;
-    Io.Dir.cwd().rename(old_log, Io.Dir.cwd(), new_log, io) catch return;
+    // Preserving: an archive already at the destination is never replaced;
+    // the old log then simply stays where it is.
+    Io.Dir.cwd().renamePreserve(old_log, Io.Dir.cwd(), new_log, io) catch return;
     Io.Dir.cwd().deleteFile(io, old_state) catch {};
 }
 
 /// Append to a file, creating it when absent. `writeFile` truncates, so the
-/// size has to be read and the write positioned at it.
+/// size has to be read and the write positioned at it - safe only because
+/// `record` holds the state lock around it.
 fn append(io: Io, path: []const u8, bytes: []const u8) !void {
     // `read` is not for reading: on Windows the size query needs the attribute
     // access it brings, and without it `stat` fails and nothing is ever written.
@@ -287,9 +344,9 @@ test "writeName cuts an over-long bucket id" {
     try std.testing.expectEqual(@as(usize, max_name_len), (try writeName(&buf, long)).len);
 }
 
-test "stateKey carries percentages but not resets" {
+test "stateKey carries percentages and resets" {
     var buf: [256]u8 = undefined;
-    try std.testing.expectEqualStrings("5h=4 7d=47", try stateKey(&buf, .{
+    try std.testing.expectEqualStrings("5h=4@1789942200 7d=47@1790434800", try stateKey(&buf, .{
         .now = 1000,
         .source = "claude",
         .windows = &claude_windows,
@@ -315,6 +372,20 @@ test "shouldWrite records a window appearing or disappearing" {
 
 test "shouldWrite suppresses unchanged percentages inside the interval" {
     try std.testing.expect(!shouldWrite("990\t5h=50 7d=10", 1000, "5h=50 7d=10", 300));
+}
+
+test "shouldWrite records a moved reset even when no percentage moved" {
+    // A window that rolled over at the same level says so with a new reset; the
+    // log must not keep the old one for another interval.
+    try std.testing.expect(shouldWrite("990\t5h=0@5000 7d=10@90000", 1000, "5h=0@23000 7d=10@90000", 300));
+    // A reset that appears where there was none is new information too.
+    try std.testing.expect(shouldWrite("990\t5h=0 7d=10", 1000, "5h=0@23000 7d=10", 300));
+}
+
+test "shouldWrite ignores a countdown reset's jitter" {
+    try std.testing.expect(!shouldWrite("990\tfast=10@5000", 1000, "fast=10@5001", 300));
+    try std.testing.expect(!shouldWrite("990\tfast=10@5000", 1000, "fast=10@4880", 300));
+    try std.testing.expect(shouldWrite("990\tfast=10@5000", 1000, "fast=10@4879", 300));
 }
 
 test "shouldWrite records unchanged percentages past the interval" {
@@ -346,4 +417,52 @@ test "groupOf splits a window off its allowance" {
     try std.testing.expectEqualStrings("", groupOf("7d"));
     // The LAST dash wins, so a hyphenated id keeps its tail as the window.
     try std.testing.expectEqualStrings("gemini-3-pro", groupOf("gemini-3-pro-5h"));
+}
+
+test "groupOf keeps a Codex bucket's windows together" {
+    // Codex names an additional bucket's windows `<bucket>.<window>`, and the
+    // bucket id may carry dashes of its own.
+    try std.testing.expectEqualStrings("fast", groupOf("fast.5h"));
+    try std.testing.expectEqualStrings("fast", groupOf("fast.7d"));
+    try std.testing.expectEqualStrings("gpt-5-mini", groupOf("gpt-5-mini.5h"));
+    try std.testing.expectEqualStrings("odd_id-1a2b3c4d", groupOf("odd_id-1a2b3c4d.secondary"));
+}
+
+test "record writes a moved sample once and keeps the state in step" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const g = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const s: Sample = .{ .now = 1000, .source = "claude", .windows = &claude_windows };
+    record(g, io, dir, s, 300);
+    record(g, io, dir, s, 300);
+    var moved = claude_windows;
+    moved[0].pct = 5;
+    record(g, io, dir, .{ .now = 1010, .source = "claude", .windows = &moved }, 300);
+    const log = try tmp.dir.readFileAlloc(io, "quota-claude.log", g, .limited(4096));
+    try std.testing.expectEqualStrings(
+        "1000\t5h=4@1789942200\t7d=47@1790434800\n1010\t5h=5@1789942200\t7d=47@1790434800\n",
+        log,
+    );
+    const state = try tmp.dir.readFileAlloc(io, "quota-claude.state", g, .limited(4096));
+    try std.testing.expectEqualStrings("1010\t5h=5@1789942200 7d=47@1790434800", state);
+}
+
+test "record stands down while another writer holds the state lock" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const g = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const held = try tmp.dir.createFile(io, "quota-claude.state", .{ .truncate = false, .read = true, .lock = .exclusive });
+    record(g, io, dir, .{ .now = 1000, .source = "claude", .windows = &claude_windows }, 300);
+    held.close(io);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "quota-claude.log", .{}));
 }

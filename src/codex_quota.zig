@@ -142,6 +142,14 @@ fn verifyLastLine(tail: []const u8, sample: quota.Sample) !void {
         const w = sample.windows[count];
         const text = try std.fmt.bufPrint(&expected, "{s}={d}", .{ w.name, w.pct });
         if (!std.mem.eql(u8, text, entry[0..stop])) return error.SampleNotRecorded;
+        // The reset is part of the answer: a log still holding the previous
+        // window's reset has not recorded this sample, whatever the level says.
+        const logged: i64 = if (stop < entry.len)
+            std.fmt.parseInt(i64, entry[stop + 1 ..], 10) catch return error.SampleNotRecorded
+        else
+            quota.absent;
+        if ((logged == quota.absent) != (w.reset == quota.absent)) return error.SampleNotRecorded;
+        if (@abs(logged - w.reset) > quota.reset_tolerance_s) return error.SampleNotRecorded;
         count += 1;
     }
     if (count != sample.windows.len) return error.SampleNotRecorded;
@@ -179,12 +187,17 @@ pub fn windowName(a: Allocator, bucket: []const u8, slot: []const u8, minutes: ?
     var safe: [quota.max_name_len]u8 = undefined;
     const name = try quota.writeName(&safe, raw);
     if (std.mem.eql(u8, raw, name)) return try a.dupe(u8, name);
-    // Keep the prior collector's stable, collision-resistant names. Sanitization
-    // itself belongs to quota.writeName; the hash preserves the original identity.
+    // A bucket id that does not survive sanitizing (or does not fit) becomes a
+    // short prefix plus a hash of the original id, so distinct ids stay distinct.
+    // The window stays after the `.`, which keeps both windows of one bucket in
+    // one group for quota.groupOf.
+    var safe_bucket: [quota.max_name_len]u8 = undefined;
+    const prefix = try quota.writeName(&safe_bucket, bucket);
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+    std.crypto.hash.sha2.Sha256.hash(bucket, &digest, .{});
     const hex = std.fmt.bytesToHex(digest[0..4], .lower);
-    return try std.fmt.allocPrint(a, "{s}-{s}", .{ name[0..@min(name.len, 23)], hex });
+    const hashed = try std.fmt.allocPrint(a, "{s}-{s}.{s}", .{ prefix[0..@min(prefix.len, 8)], hex, duration });
+    return try a.dupe(u8, try quota.writeName(&safe, hashed));
 }
 
 fn addBucket(a: Allocator, out: *std.ArrayList(quota.Window), bucket: []const u8, limits: Value) !void {
@@ -336,6 +349,19 @@ test "Codex names remain distinct and safe after gaze sanitizes them" {
     }
 }
 
+test "Codex keeps a hashed bucket's two windows in one group" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const five = try windowName(a, "team plan/fast", "primary", 300);
+    const week = try windowName(a, "team plan/fast", "secondary", 10080);
+    try std.testing.expect(!std.mem.eql(u8, five, week));
+    try std.testing.expectEqualStrings(quota.groupOf(five), quota.groupOf(week));
+    try std.testing.expect(std.mem.endsWith(u8, five, ".5h"));
+    // A plain dotted name groups by its bucket too.
+    try std.testing.expectEqualStrings("fast", quota.groupOf(try windowName(a, "fast", "primary", 300)));
+}
+
 test "Codex rejects duplicate names and more than eight windows" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -380,4 +406,7 @@ test "Codex records through gaze, deduplicates and reports failed writes" {
     }
     try std.testing.expectError(error.SampleNotRecorded, verifyLastLine("2\t5h=19\t7d=3\n", sample));
     try std.testing.expectError(error.SampleNotRecorded, verifyLastLine("1000\t5h=20\t7d=3\n", sample));
+    // Same levels, but the 5h reset is the previous window's.
+    try std.testing.expectError(error.SampleNotRecorded, verifyLastLine("1000\t5h=19@1789925916\t7d=3@1790530716\n", sample));
+    try verifyLastLine("1000\t5h=19@1789943916\t7d=3@1790530716\n", sample);
 }
