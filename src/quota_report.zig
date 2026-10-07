@@ -275,7 +275,10 @@ fn paceText(a: Allocator, pace: ?f64) ![]const u8 {
 /// The status line's glyphs, spelled out: where an even burn would be, and why
 /// a warning fired.
 fn scheduleText(a: Allocator, color: bool, s: Sampled) ![]const u8 {
-    const sc = s.schedule orelse return "  schedule  weekly reset since sample\n";
+    const sc = s.schedule orelse return if (s.weekly.stale)
+        "  schedule  weekly reset since sample\n"
+    else
+        "  schedule  none: the sample's weekly level or reset is implausible\n";
     const why = if (std.mem.eql(u8, sc.weekly_glyph, "--"))
         "--: skip one more window and the rest cannot be spent"
     else if (std.mem.eql(u8, sc.weekly_glyph, "++"))

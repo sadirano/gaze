@@ -22,6 +22,7 @@
 //! recomputed from the live payload and clock on every render.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const report = @import("quota_report.zig");
@@ -151,12 +152,12 @@ pub const Inputs = struct {
     hours: f64 = 24,
 };
 
-/// `<ratio x 1e4> <learned 0|1> <days> <24 two-digit weights>`, under the
+/// `<ratio x 1e4> <learned 0|1> <days> <24 three-digit weights>`, under the
 /// cache's 128-byte line.
 pub fn encode(buf: []u8, in: Inputs) ![]const u8 {
     var w: Io.Writer = .fixed(buf);
     try w.print("{d} {d} {d} ", .{ @as(i64, @intFromFloat(@round(in.ratio * 10000))), @intFromBool(in.learned), in.profile.days });
-    for (in.profile.w) |x| try w.print("{d:0>2}", .{@as(u8, @intFromFloat(@round(std.math.clamp(x, 0, 1) * 99)))});
+    for (in.profile.w) |x| try w.print("{d:0>3}", .{@as(u16, @intFromFloat(@round(std.math.clamp(x, 0, 1) * 999)))});
     return w.buffered();
 }
 
@@ -166,14 +167,25 @@ pub fn decode(raw: []const u8) ?Inputs {
     const l = it.next() orelse return null;
     const days = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
     const ws = it.next() orelse return null;
-    if (r <= 0 or ws.len != 48 or l.len != 1) return null;
+    if (r <= 0 or ws.len != 72 or l.len != 1) return null;
     var p: Profile = .{ .days = days };
     for (0..24) |h| {
-        const v = std.fmt.parseInt(u8, ws[2 * h .. 2 * h + 2], 10) catch return null;
-        p.w[h] = @as(f64, @floatFromInt(v)) / 99;
+        const v = std.fmt.parseInt(u16, ws[3 * h .. 3 * h + 3], 10) catch return null;
+        p.w[h] = @as(f64, @floatFromInt(v)) / 999;
     }
     if (days == 0) p = .wall;
     return .{ .ratio = @as(f64, @floatFromInt(r)) / 10000, .learned = l[0] == '1', .profile = p };
+}
+
+/// Round weights to what the cache stores, so a fresh learn and a cache hit
+/// rank hours identically: a tie created by rounding must exist in both or
+/// neither, or the capacity hours (and the glyph) differ between renders.
+/// Off Windows the local offset is unknown (0), so no profile is learned at all:
+/// UTC days read as local ones would be a guess.
+fn quantize(p: Profile) Profile {
+    var q = p;
+    for (&q.w) |*x| x.* = @round(std.math.clamp(x.*, 0, 1) * 999) / 999;
+    return q;
 }
 
 /// Learn the inputs from a source's rows for one allowance.
@@ -183,7 +195,7 @@ pub fn learn(a: Allocator, rows: report.Rows, spec: report.Spec, now: i64, offse
     return .{
         .ratio = if (learned) r.value.? else spec.fallback,
         .learned = learned,
-        .profile = learnProfile(rows, now, offset),
+        .profile = quantize(if (builtin.os.tag == .windows) learnProfile(rows, now, offset) else .wall),
     };
 }
 
@@ -212,7 +224,9 @@ pub fn cachedInputs(
     return in;
 }
 
-/// About a month of samples at the busiest rate seen so far.
+/// Far more than the 28-day horizon needs: the log runs ~6 KB a day (one line
+/// per point moved or 300 s), so 1 MiB is months. `gaze quota` reads more, but
+/// the rows past the horizon are ignored by both, so they learn the same profile.
 const render_log_bytes: u64 = 1024 * 1024;
 
 pub const Glyph = enum {
@@ -251,7 +265,7 @@ pub const Weekly = struct {
 /// starts on use) or when the level is not a plausible one.
 fn running5h(s: ?Level, now: i64) ?Level {
     const l = s orelse return null;
-    if (l.reset <= now or l.reset > now + five_h or l.used < 0 or l.used > 100) return null;
+    if (l.reset <= now or l.reset > now + five_h or l.used < 0) return null;
     return l;
 }
 
@@ -269,7 +283,7 @@ pub fn weekly(in: Inputs, offset: i64, w: Level, s: ?Level, now: i64) ?Weekly {
     const c = 100 * in.ratio;
 
     const cur = running5h(s, now);
-    const cur_cap: f64 = if (cur) |l| @as(f64, @floatFromInt(100 - l.used)) / 100 else 0;
+    const cur_cap: f64 = if (cur) |l| @as(f64, @floatFromInt(@max(0, 100 - l.used))) / 100 else 0;
     const cur_end = if (cur) |l| l.reset else now;
     // A window can start with less than five hours left and still spend, so the
     // last partial one counts, but never more windows than active time allows.
@@ -332,6 +346,24 @@ test "five hour bands, the half-way rule and exhaustion" {
     // No division at the very start; spent before reset always warns.
     try tt.expectEqual(Glyph.even, fiveHour(.{ .used = 0, .reset = reset }, monday).?);
     try tt.expectEqual(Glyph.ahead_warn, fiveHour(.{ .used = 100, .reset = reset }, reset - 60).?);
+}
+
+test "a 5h level past 100 is saturated, not implausible" {
+    try tt.expectEqual(Glyph.ahead_warn, fiveHour(.{ .used = 101, .reset = monday + hour }, monday).?);
+}
+
+test "a fresh learn and a cache hit give the same glyph across a rounding tie" {
+    var p: Profile = .{ .w = @splat(0.1), .days = 9 };
+    for (1..16) |h| p.w[h] = 0.8;
+    p.w[0] = 0.300;
+    p.w[16] = 0.3004;
+    const in: Inputs = .{ .ratio = 0.125, .learned = true, .profile = quantize(p), .hours = 16 };
+    var buf: [120]u8 = undefined;
+    var back = decode(try encode(&buf, in)).?;
+    back.hours = 16;
+    const reset = monday + 17 * hour;
+    const w: Level = .{ .used = 98, .reset = reset };
+    try tt.expectEqual(weekly(in, 0, w, null, monday + 11 * hour).?.glyph, weekly(back, 0, w, null, monday + 11 * hour).?.glyph);
 }
 
 test "five hour has no glyph once the window has reset" {
@@ -481,12 +513,12 @@ test "inputs survive the cache round trip" {
     for (0..24) |h| in.profile.w[h] = @as(f64, @floatFromInt(h)) / 23;
     var buf: [120]u8 = undefined;
     const line = try encode(&buf, in);
-    try tt.expect(line.len < 100);
+    try tt.expect(line.len < 110);
     const back = decode(line).?;
     try tt.expectApproxEqAbs(in.ratio, back.ratio, 1e-9);
     try tt.expect(back.learned);
     try tt.expectEqual(@as(u32, 9), back.profile.days);
     try tt.expectApproxEqAbs(in.profile.w[17], back.profile.w[17], 0.01);
     try tt.expect(decode("junk") == null);
-    try tt.expect(decode("0 1 0 " ++ "00" ** 24) == null);
+    try tt.expect(decode("0 1 0 " ++ "000" ** 24) == null);
 }
