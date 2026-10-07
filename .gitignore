@@ -1,2 +1,4 @@
 zig-out/
 .zig-cache/
+# Private drop for agent handoffs; never published.
+.nix/shared/

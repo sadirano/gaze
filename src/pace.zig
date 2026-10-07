@@ -340,7 +340,7 @@ test "five hour bands, the half-way rule and exhaustion" {
     try tt.expectEqual(Glyph.even, fiveHour(.{ .used = 60, .reset = reset }, half).?);
     try tt.expectEqual(Glyph.ahead_warn, fiveHour(.{ .used = 61, .reset = reset }, half).?);
     try tt.expectEqual(Glyph.behind, fiveHour(.{ .used = 39, .reset = reset }, half).?);
-    // The user's example: 50% with more than 3h left warns; exactly 3h does not.
+    // 50% with more than 3h left warns; exactly 3h does not.
     try tt.expectEqual(Glyph.ahead_warn, fiveHour(.{ .used = 50, .reset = reset }, monday + 2 * hour - 60).?);
     try tt.expectEqual(Glyph.even, fiveHour(.{ .used = 50, .reset = reset }, monday + 2 * hour).?);
     // Below half it is only ever +.
@@ -485,7 +485,7 @@ test "capacity counts the available hours, not how often they were used" {
     const now = reset - 83 * hour - 20 * 60;
     const s: Level = .{ .used = 11, .reset = now + 4 * hour + 10 * 60 };
     const w = weekly(in, 0, .{ .used = 20, .reset = reset }, s, now).?;
-    // The live case that read `--`: 80 left, over ten windows of capacity.
+    // 80 left with over ten windows of capacity must not read `--`.
     try tt.expect(w.blocks > 10);
     try tt.expect(w.glyph != .behind_warn);
 }
