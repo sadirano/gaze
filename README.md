@@ -33,7 +33,12 @@ Left to right, each one absent when its data is missing or zero:
 - **`5h% / 7d%`** - the allowance windows the payload carries, with time until
   reset, red past 80%. Claude Code sends those two; Antigravity sends its own
   buckets and they render the same way. All of them are also appended to a quota
-  log; see below.
+  log; see below. Each level of this tool carries a pace glyph: `=` even burn,
+  `-` behind, `+` ahead. Weekly `--` means skipping one more 5h window would
+  leave the rest unspendable; weekly `++` means ahead by more than a window's
+  worth; 5h `++` means past half and more than 10 points ahead. "Even" runs on
+  active hours learned from the log, and `gaze quota` shows the numbers behind
+  each glyph.
 - **`Ag33% X98%`** - what the OTHER tools have left, one letter each, so free
   quota elsewhere is a glance rather than a question. See below.
 - **`#n%`** - context window used.
@@ -74,6 +79,9 @@ is a single short file, so it is always current and effectively free.
 --source <name>         file quota samples under this tool's name instead of
                         the one inferred from the payload
 --no-peers              do not show what the other tools have left
+--pace-ttl <seconds>    how often to re-learn pace inputs from the log
+                        (default 600; 0 = every render)
+--no-pace               drop the pace glyphs
 --codex-ttl <seconds>   how often to re-read Codex's transcripts
                         (default 60; 0 = every render)
 -h, --help

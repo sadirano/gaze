@@ -46,6 +46,8 @@ If you need a new segment that requires spawning something, put it behind
 | `src/codex_quota.zig` | `gaze codex-quota`: the JSON-RPC collector. Never on the render path |
 | `src/codex_peek.zig` | Codex's limits, read from its session transcripts. Cached |
 | `src/peers.zig` | the other sources' levels, read from their logs |
+| `src/pace.zig` | the pace glyphs: activity profile, schedule and capacity. Cached inputs |
+| `src/quota_report.zig` | `gaze quota`, plus the log parser and ratio learner pace reuses |
 
 ## Build and test
 
@@ -109,7 +111,25 @@ Claude Code's transcripts, gaze reads `.git/HEAD`, and this is the same move.
 per 5h point from log history, and prints a table, `--brief`, or `--json`.
 `--hours` adjusts active time per day. `GAZE_QUOTA_NOW` overrides the clock for
 tests. Missing logs appear as unsampled buckets; this command is never called
-from the status-line render path.
+from the status-line render path (its log parser and ratio learner are, through
+`pace.zig`, behind the pace cache).
+
+## Pace glyphs
+
+`src/pace.zig` is the one evaluator behind both the status line glyph and the
+`schedule` line of `gaze quota`. Never compute a glyph anywhere else.
+
+- **Two activity models, on purpose.** The schedule ("even burn") weights each
+  hour by how often it saw use. An hour counts once per day, never once per
+  sample, because the log writes one line per point moved. Capacity (the `--`
+  test) asks when you *could* spend, so it takes the profile's busiest
+  `QUOTA_ACTIVE_HOURS` hours as fully available. Pricing capacity by past use
+  made a quiet week read as unrecoverable. `--` wins when the two disagree.
+- **Cache history, never the answer.** Only the ratio and profile are cached
+  (`gaze-pace-*` in the temp dir, `--pace-ttl`). The glyph is recomputed from
+  the payload on every render, so it cannot outlive a reset.
+- A reset already passed, or an implausible level, means no glyph. Never guess
+  about the new window.
 
 ## Showing another tool's level honestly
 
