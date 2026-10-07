@@ -43,10 +43,19 @@ const usage =
     \\  --no-peers             do not show what the other tools have left
     \\  --codex-ttl <seconds>  how often to re-read Codex's transcripts
     \\                         (default 60; 0 re-reads on every render)
+    \\  --pace-ttl <seconds>   how often to re-learn pace inputs from the log
+    \\                         (default 600; 0 re-learns on every render)
+    \\  --no-pace              drop the pace glyph after each quota level
     \\  -h, --help             this text
     \\
-    \\GAZE_DIRTY_TTL, GAZE_HOOT_TTL, GAZE_CODEX_TTL and GAZE_SOURCE set the same
-    \\intervals and name; flags win.
+    \\GAZE_DIRTY_TTL, GAZE_HOOT_TTL, GAZE_CODEX_TTL, GAZE_PACE_TTL and GAZE_SOURCE
+    \\set the same intervals and name; flags win.
+    \\
+    \\Each of this tool's quota levels carries a pace glyph: `=` on an even burn,
+    \\`-` behind, `+` ahead. Weekly `--` means one more skipped 5h window and the
+    \\rest cannot be spent; weekly `++` means ahead by more than a window's worth.
+    \\5h `++` means past half and more than 10 points ahead. Weekly "even" runs on
+    \\active hours learned from the log; `gaze quota` shows the numbers behind it.
     \\
     \\Every OTHER source's level is shown too, read from its own log - so free
     \\quota somewhere else is a glance rather than a question. One letter each:
@@ -99,6 +108,11 @@ const default_quota_interval_s: i64 = 300;
 /// rest of a render, and Codex's number cannot move while Codex is not running.
 const default_codex_ttl_s: u32 = 60;
 
+/// How often the pace inputs (learned ratio, activity profile) are re-learned
+/// from the log. They move over days, so minutes of lag cost nothing; the glyph
+/// itself is recomputed from the live payload on every render.
+const default_pace_ttl_s: u32 = 600;
+
 const Config = struct {
     dirty_ttl_s: u32 = default_ttl_s,
     hoot_ttl_s: u32 = default_ttl_s,
@@ -114,6 +128,8 @@ const Config = struct {
     /// its own transcripts.
     peers: bool = true,
     codex_ttl_s: u32 = default_codex_ttl_s,
+    pace: bool = true,
+    pace_ttl_s: u32 = default_pace_ttl_s,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -173,6 +189,7 @@ fn parseArgs(
     if (envTtl(env, "GAZE_DIRTY_TTL")) |n| cfg.dirty_ttl_s = n;
     if (envTtl(env, "GAZE_HOOT_TTL")) |n| cfg.hoot_ttl_s = n;
     if (envTtl(env, "GAZE_CODEX_TTL")) |n| cfg.codex_ttl_s = n;
+    if (envTtl(env, "GAZE_PACE_TTL")) |n| cfg.pace_ttl_s = n;
     if (env.get("GAZE_SOURCE")) |s| {
         const t = std.mem.trim(u8, s, " \t");
         if (t.len > 0) cfg.source = t;
@@ -199,6 +216,10 @@ fn parseArgs(
             cfg.peers = false;
             continue;
         }
+        if (std.mem.eql(u8, a, "--no-pace")) {
+            cfg.pace = false;
+            continue;
+        }
         if (try ttlFlag(args, &i, "--dirty-ttl")) |n| {
             cfg.dirty_ttl_s = n;
             continue;
@@ -209,6 +230,10 @@ fn parseArgs(
         }
         if (try ttlFlag(args, &i, "--codex-ttl")) |n| {
             cfg.codex_ttl_s = n;
+            continue;
+        }
+        if (try ttlFlag(args, &i, "--pace-ttl")) |n| {
+            cfg.pace_ttl_s = n;
             continue;
         }
         if (try valueFlag(args, &i, "--source")) |s| {
@@ -351,11 +376,15 @@ fn render(
     const now = cache.nowSeconds(io);
     var win_buf: [quota_mod.max_windows]quota_mod.Window = undefined;
     const q = collectQuota(root, &win_buf, now);
+    const source = cfg.source orelse q.source;
+    const quota_dir = quotaDir(arena, env);
+    var glyphs: [quota_mod.max_windows]?pace.Glyph = @splat(null);
+    if (cfg.pace) paceGlyphs(arena, io, quota_dir, tmpDir(env), source, q.windows, cfg.pace_ttl_s, pace.hoursFrom(env.get("QUOTA_ACTIVE_HOURS")), now, &glyphs);
     // One segment per allowance, labelled when there is more than one to tell
     // apart. Antigravity meters a Claude model and a Gemini model separately, so
     // a bare row of four percentages would say nothing about which is which.
     var group: ?[]const u8 = null;
-    for (q.windows) |w| {
+    for (q.windows, 0..) |w, wi| {
         const g = quota_mod.groupOf(w.name);
         if (group == null or !std.mem.eql(u8, g, group.?)) {
             try line.seg();
@@ -363,14 +392,12 @@ fn render(
         } else {
             try line.color("33", " / ");
         }
-        try quotaSeg(arena, line, now, w);
+        try quotaSeg(arena, line, now, w, glyphs[wi]);
         group = g;
     }
 
     // The weekly allowance does not roll over, so pace matters as much as level
     // - and pace needs a history this payload does not carry. Log the sample.
-    const source = cfg.source orelse q.source;
-    const quota_dir = quotaDir(arena, env);
     if (cfg.quota_log) {
         quota_mod.record(arena, io, quota_dir, .{
             .now = now,
@@ -534,15 +561,66 @@ fn collectQuota(root: std.json.Value, buf: []quota_mod.Window, now: i64) Quota {
     return .{ .source = "claude", .windows = &.{} };
 }
 
-fn quotaSeg(arena: std.mem.Allocator, line: *Line, now: i64, w: quota_mod.Window) !void {
+fn quotaSeg(arena: std.mem.Allocator, line: *Line, now: i64, w: quota_mod.Window, glyph: ?pace.Glyph) !void {
     const p = if (w.pct == quota_mod.absent) 0 else w.pct;
     const code: []const u8 = if (p > 80) "31" else "33";
     try line.color(code, try std.fmt.allocPrint(arena, "{d}%", .{p}));
+    if (glyph) |g| {
+        // Plain glyphs are a glance; the two warnings have to pull the eye, and
+        // in different colors, since they ask for opposite things.
+        const g_code: []const u8 = switch (g) {
+            .ahead_warn => "1;31",
+            .behind_warn => "1;36",
+            else => "90",
+        };
+        try line.color(g_code, g.text());
+    }
     if (w.reset != quota_mod.absent) {
         if (timeLeft(arena, now, w.reset)) |t| {
             try line.color("90", try std.fmt.allocPrint(arena, " {s}", .{t}));
         }
     }
+}
+
+/// The pace glyph for each of this source's windows, by index into `windows`.
+/// Only the tool this line belongs to: the peers stay a glance. Any failure
+/// leaves that window without a glyph.
+fn paceGlyphs(
+    arena: std.mem.Allocator,
+    io: Io,
+    quota_dir: []const u8,
+    tmp_dir: []const u8,
+    source: []const u8,
+    windows: []const quota_mod.Window,
+    ttl_s: u32,
+    hours: f64,
+    now: i64,
+    out: []?pace.Glyph,
+) void {
+    const offset = quota_report.localOffset();
+    for (quota_report.specs) |spec| {
+        if (!std.mem.eql(u8, spec.tool, source)) continue;
+        const si = windowIndex(windows, quota_report.names[spec.short]);
+        const short: ?pace.Level = if (si) |i| levelOf(windows[i]) else null;
+        if (si) |i| if (short) |l| {
+            out[i] = pace.fiveHour(l, now);
+        };
+        const i = windowIndex(windows, quota_report.names[spec.weekly]) orelse continue;
+        const w = levelOf(windows[i]) orelse continue;
+        var in = pace.cachedInputs(arena, io, quota_dir, tmp_dir, spec, ttl_s, now, offset) orelse continue;
+        in.hours = hours;
+        if (pace.weekly(in, offset, w, short, now)) |r| out[i] = r.glyph;
+    }
+}
+
+fn windowIndex(windows: []const quota_mod.Window, name: []const u8) ?usize {
+    for (windows, 0..) |w, i| if (std.mem.eql(u8, w.name, name)) return i;
+    return null;
+}
+
+fn levelOf(w: quota_mod.Window) ?pace.Level {
+    if (w.pct == quota_mod.absent or w.reset == quota_mod.absent) return null;
+    return .{ .used = w.pct, .reset = w.reset };
 }
 
 /// "@2h15m" / "@45m" until the given unix timestamp, or null once it has passed.

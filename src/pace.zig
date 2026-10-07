@@ -11,8 +11,11 @@
 //!
 //! "Even" runs on active time, not the wall clock: an hour-of-day profile learned
 //! from the log's own sample times, so a night asleep does not read as falling
-//! behind. The same profile prices the capacity left, so the schedule and the
-//! `--` test never assume two different users. `--` wins over everything else.
+//! behind. Capacity asks a different question - not when you tend to spend but
+//! when you could - so it takes the profile's top QUOTA_ACTIVE_HOURS hours as
+//! fully available. Pricing capacity by past use alone made every quiet week
+//! read as unrecoverable (20% used, 3.5 days left: `--`). `--` wins over
+//! everything else, which settles the rare case the two models disagree.
 //!
 //! One evaluator serves the status line and `gaze quota`, so they cannot
 //! disagree. Only the learned inputs (ratio, profile) are cached; the glyph is
@@ -46,6 +49,28 @@ pub const Profile = struct {
     days: u32 = 0,
 
     pub const wall: Profile = .{};
+
+    /// The hours that count as available for spending: the `hours` busiest of a
+    /// learned profile at full weight (a fractional last one at its fraction),
+    /// or, without one, every hour at `hours / 24`.
+    pub fn availability(p: Profile, hours: f64) Profile {
+        const n = std.math.clamp(hours, 0, 24);
+        if (p.days == 0) return .{ .w = @splat(n / 24), .days = 0 };
+        var order: [24]u8 = undefined;
+        for (&order, 0..) |*o, i| o.* = @intCast(i);
+        std.mem.sort(u8, &order, p, struct {
+            fn busier(prof: Profile, x: u8, y: u8) bool {
+                return prof.w[x] > prof.w[y] or (prof.w[x] == prof.w[y] and x < y);
+            }
+        }.busier);
+        var out: Profile = .{ .w = @splat(0), .days = p.days };
+        var left = n;
+        for (order) |h| {
+            out.w[h] = @min(1, left);
+            left = @max(0, left - 1);
+        }
+        return out;
+    }
 
     /// Profile-weighted seconds in [t0, t1). `offset` turns unix seconds into
     /// local wall seconds.
@@ -106,6 +131,14 @@ pub fn learnProfile(rows: report.Rows, now: i64, offset: i64) Profile {
     return p;
 }
 
+/// QUOTA_ACTIVE_HOURS as the status line reads it: anything missing or outside
+/// 1-24 is the wall clock, since a render has nowhere to report a bad value.
+pub fn hoursFrom(raw: ?[]const u8) f64 {
+    const s = std.mem.trim(u8, raw orelse return 24, " \t");
+    const h = std.fmt.parseFloat(f64, s) catch return 24;
+    return if (h >= 1 and h <= 24) h else 24;
+}
+
 /// What the cache holds: the slow, history-derived inputs, never an answer that
 /// depends on the clock.
 pub const Inputs = struct {
@@ -113,6 +146,9 @@ pub const Inputs = struct {
     ratio: f64,
     learned: bool,
     profile: Profile,
+    /// Hours a day available for spending (QUOTA_ACTIVE_HOURS). Configuration,
+    /// not history, so it is set by the caller and never cached.
+    hours: f64 = 24,
 };
 
 /// `<ratio x 1e4> <learned 0|1> <days> <24 two-digit weights>`, under the
@@ -239,7 +275,8 @@ pub fn weekly(in: Inputs, offset: i64, w: Level, s: ?Level, now: i64) ?Weekly {
     // last partial one counts, but never more windows than active time allows.
     const span = @max(0, w.reset - cur_end);
     const opportunities: f64 = @floatFromInt(@divFloor(span + five_h - 1, five_h));
-    const after = @min(opportunities, in.profile.active(offset, cur_end, w.reset) / @as(f64, @floatFromInt(five_h)));
+    const avail = in.profile.availability(in.hours);
+    const after = @min(opportunities, avail.active(offset, cur_end, w.reset) / @as(f64, @floatFromInt(five_h)));
     const blocks = cur_cap + after;
 
     const remaining = 100 - used;
@@ -402,6 +439,40 @@ test "a night asleep does not read as behind" {
     const w = weekly(in, 0, .{ .used = 14, .reset = reset }, null, monday + 86400 + 8 * hour).?;
     try tt.expectApproxEqAbs(@as(f64, 100.0 / 7.0), w.expected, 1e-9);
     try tt.expectEqual(Glyph.even, w.glyph);
+}
+
+test "capacity counts the available hours, not how often they were used" {
+    // A night owl who used each daytime hour on only a third of days.
+    var in = flat(0.1264);
+    for (0..24) |h| in.profile.w[h] = if (h >= 8) 0.33 else 0.05;
+    in.profile.days = 13;
+    in.hours = 16;
+    const reset = monday + week;
+    const now = reset - 83 * hour - 20 * 60;
+    const s: Level = .{ .used = 11, .reset = now + 4 * hour + 10 * 60 };
+    const w = weekly(in, 0, .{ .used = 20, .reset = reset }, s, now).?;
+    // The live case that read `--`: 80 left, over ten windows of capacity.
+    try tt.expect(w.blocks > 10);
+    try tt.expect(w.glyph != .behind_warn);
+}
+
+test "availability keeps the busiest hours, and the wall clock spreads them" {
+    var p: Profile = .{ .w = @splat(0.1), .days = 7 };
+    for (8..24) |h| p.w[h] = 0.5;
+    const a = p.availability(16.5);
+    try tt.expectEqual(@as(f64, 1), a.w[8]);
+    try tt.expectEqual(@as(f64, 1), a.w[23]);
+    try tt.expectEqual(@as(f64, 0.5), a.w[0]);
+    try tt.expectEqual(@as(f64, 0), a.w[7]);
+    const wall = Profile.wall.availability(16);
+    try tt.expectApproxEqAbs(@as(f64, 16.0 / 24.0), wall.w[3], 1e-12);
+}
+
+test "QUOTA_ACTIVE_HOURS out of range is the wall clock" {
+    try tt.expectEqual(@as(f64, 16), hoursFrom("16"));
+    try tt.expectEqual(@as(f64, 24), hoursFrom(null));
+    try tt.expectEqual(@as(f64, 24), hoursFrom("0"));
+    try tt.expectEqual(@as(f64, 24), hoursFrom("abc"));
 }
 
 test "inputs survive the cache round trip" {

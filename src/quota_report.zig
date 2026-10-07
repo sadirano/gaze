@@ -22,7 +22,7 @@ pub const usage =
 const five_h: i64 = 5 * 3600;
 const week: i64 = 7 * 86400;
 const max_log: u64 = 64 * 1024 * 1024;
-const names = [_][]const u8{ "5h", "7d", "gemini-5h", "gemini-weekly", "3p-5h", "3p-weekly" };
+pub const names = [_][]const u8{ "5h", "7d", "gemini-5h", "gemini-weekly", "3p-5h", "3p-weekly" };
 pub const Spec = struct { tool: []const u8, short: usize, weekly: usize, id: []const u8, name: []const u8, fallback: f64 };
 pub const specs = [_]Spec{
     .{ .tool = "claude", .short = 0, .weekly = 1, .id = "claude/claude", .name = "Claude", .fallback = 0.125 },
