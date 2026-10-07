@@ -3,6 +3,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const cache = @import("cache.zig");
+const pace_mod = @import("pace.zig");
 
 pub const usage =
     \\gaze quota - every agent's 5h and weekly quota, and whether the weekly will get used.
@@ -54,6 +55,17 @@ const Sampled = struct {
     max_spendable: f64,
     will_expire: f64,
     verdict: []const u8,
+    schedule: ?ScheduleJson,
+};
+/// The status line's glyphs and the numbers behind them, from the same
+/// evaluator. Null when the sample's week has reset (nothing to compare).
+const ScheduleJson = struct {
+    weekly_glyph: []const u8,
+    five_hour_glyph: ?[]const u8,
+    expected: f64,
+    delta: f64,
+    blocks: f64,
+    profile_days: u32,
 };
 const Unsampled = struct { id: []const u8, name: []const u8, sampled: bool = false };
 const Bucket = union(enum) { sampled: Sampled, unsampled: Unsampled };
@@ -170,7 +182,24 @@ fn verdictFor(remaining: i64, pace: ?f64, tight: f64) []const u8 {
     return "ok";
 }
 
-fn measure(a: Allocator, rows: Rows, spec: Spec, now: i64, hours: f64, tight: f64) !Bucket {
+fn schedule(a: Allocator, rows: Rows, spec: Spec, row: Row, now: i64, hours: f64, offset: i64) !?ScheduleJson {
+    var in = try pace_mod.learn(a, rows, spec, now, offset);
+    in.hours = hours;
+    const wl = row.fields[spec.weekly].?;
+    const sl = row.fields[spec.short].?;
+    const short: pace_mod.Level = .{ .used = sl.pct, .reset = sl.reset };
+    const r = pace_mod.weekly(in, offset, .{ .used = wl.pct, .reset = wl.reset }, short, now) orelse return null;
+    return .{
+        .weekly_glyph = r.glyph.text(),
+        .five_hour_glyph = if (pace_mod.fiveHour(short, now)) |g| g.text() else null,
+        .expected = rounded(r.expected, 10),
+        .delta = rounded(r.delta, 10),
+        .blocks = rounded(r.blocks, 100),
+        .profile_days = in.profile.days,
+    };
+}
+
+fn measure(a: Allocator, rows: Rows, spec: Spec, now: i64, hours: f64, tight: f64, offset: i64) !Bucket {
     var latest: ?Row = null;
     var i = rows.len;
     while (i > 0) {
@@ -212,6 +241,7 @@ fn measure(a: Allocator, rows: Rows, spec: Spec, now: i64, hours: f64, tight: f6
         .max_spendable = rounded(spendable, 10),
         .will_expire = rounded(@max(0, @as(f64, @floatFromInt(remaining)) - spendable), 10),
         .verdict = verdictFor(remaining, pace, tight),
+        .schedule = try schedule(a, rows, spec, row, now, hours, offset),
     } };
 }
 
@@ -242,11 +272,39 @@ fn paceText(a: Allocator, pace: ?f64) ![]const u8 {
     return std.fmt.allocPrint(a, "{d}%", .{@as(i64, @intFromFloat(halfEven(p)))});
 }
 
+/// The status line's glyphs, spelled out: where an even burn would be, and why
+/// a warning fired.
+fn scheduleText(a: Allocator, color: bool, s: Sampled) ![]const u8 {
+    const sc = s.schedule orelse return "  schedule  weekly reset since sample\n";
+    const why = if (std.mem.eql(u8, sc.weekly_glyph, "--"))
+        "--: skip one more window and the rest cannot be spent"
+    else if (std.mem.eql(u8, sc.weekly_glyph, "++"))
+        "++: ahead by more than a full window"
+    else if (std.mem.eql(u8, sc.weekly_glyph, "="))
+        "on schedule"
+    else if (std.mem.eql(u8, sc.weekly_glyph, "-")) "behind" else "ahead";
+    const code: []const u8 = if (std.mem.eql(u8, sc.weekly_glyph, "--")) "1;36" else if (std.mem.eql(u8, sc.weekly_glyph, "++")) "1;31" else "2";
+    const basis = if (sc.profile_days > 0) try std.fmt.allocPrint(a, "active hours learned from {d} days", .{sc.profile_days}) else "wall clock, too little history";
+    return std.fmt.allocPrint(a, "  schedule  wk {s} 5h {s}   {d}% used vs {d:.0}% on an even burn ({s}{d:.0}); {s}  ({s})\n", .{
+        try colorize(a, color, code, sc.weekly_glyph),
+        sc.five_hour_glyph orelse ".",
+        s.weekly.used,
+        sc.expected,
+        if (sc.delta >= 0) "+" else "",
+        sc.delta,
+        try colorize(a, color, code, why),
+        basis,
+    });
+}
+
 fn outputBrief(a: Allocator, io: Io, buckets: [4]Bucket) !void {
     for (buckets) |bucket| {
         const line = switch (bucket) {
             .unsampled => |u| try std.fmt.allocPrint(a, "{s} no-samples\n", .{u.id}),
-            .sampled => |s| try std.fmt.allocPrint(a, "{s} 5h={d}% wk={d}% pace={s} {s}\n", .{ s.id, s.five_hour.used, s.weekly.used, try paceText(a, s.pace), s.verdict }),
+            .sampled => |s| if (s.schedule) |sc|
+                try std.fmt.allocPrint(a, "{s} 5h={d}% wk={d}% pace={s} {s} sched={s} 5hsched={s} delta={d:.0}\n", .{ s.id, s.five_hour.used, s.weekly.used, try paceText(a, s.pace), s.verdict, sc.weekly_glyph, sc.five_hour_glyph orelse ".", sc.delta })
+            else
+                try std.fmt.allocPrint(a, "{s} 5h={d}% wk={d}% pace={s} {s}\n", .{ s.id, s.five_hour.used, s.weekly.used, try paceText(a, s.pace), s.verdict }),
         };
         try Io.File.stdout().writeStreamingAll(io, line);
     }
@@ -327,6 +385,7 @@ fn outputTable(a: Allocator, io: Io, now: i64, hours: f64, buckets: [4]Bucket, c
                 const v_color: []const u8 = if (std.mem.eql(u8, s.verdict, "will_expire")) "31" else if (std.mem.eql(u8, s.verdict, "tight")) "33" else "32";
                 const lines = try std.fmt.allocPrint(a, "\n{s}  {s}\n  5h      {s} {d: >3}%  {s}\n  weekly  {s} {d: >3}%  resets {s} (in {s})\n  blocks  {d:.1} left (current {d:.1} + {d:.1} of {d} full)   ratio {d:.3} weekly per 5h point ({s}); a full window = {d:.1}% weekly\n  pace    {s} of every remaining window to spend the {d}% left (max spendable {d}%)  {s}\n", .{ try colorize(a, color, "1", s.name), try colorize(a, color, "2", try std.fmt.allocPrint(a, "sampled {d} min ago", .{age})), try colorize(a, color, s_color, try bar(a, s.five_hour.used)), @as(u64, @intCast(@max(0, s.five_hour.used))), when, try colorize(a, color, "36", try bar(a, s.weekly.used)), @as(u64, @intCast(@max(0, s.weekly.used))), try fmtAt(a, s.weekly.resets_at, offset), try fmtLeft(a, s.weekly.resets_at - now), s.blocks.usable, s.blocks.current, s.blocks.after_current, s.blocks.full, s.ratio.value, src, 100 * s.ratio.value, try colorize(a, color, v_color, try paceText(a, s.pace)), remaining, @as(i64, @intFromFloat(halfEven(@min(s.max_spendable, 999)))), try colorize(a, color, v_color, verdict) });
                 try Io.File.stdout().writeStreamingAll(io, lines);
+                try Io.File.stdout().writeStreamingAll(io, try scheduleText(a, color, s));
             },
         }
     }
@@ -354,6 +413,7 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
         std.process.exit(2);
     }
     const now = if (env.get("GAZE_QUOTA_NOW")) |raw| std.fmt.parseInt(i64, raw, 10) catch cache.nowSeconds(io) else cache.nowSeconds(io);
+    const offset = localOffset();
     const base = try envDir(a, env);
     const claude = try readLog(a, io, base, "claude");
     const codex = try readLog(a, io, base, "codex");
@@ -361,7 +421,7 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     var buckets: [4]Bucket = undefined;
     for (specs, 0..) |spec, i| {
         const rows = if (i == 0) claude else if (i == 1) codex else agy;
-        buckets[i] = try measure(a, rows, spec, now, hours, if (hours >= 24) 60 else 85);
+        buckets[i] = try measure(a, rows, spec, now, hours, if (hours >= 24) 60 else 85, offset);
     }
     for (args) |arg| if (std.mem.eql(u8, arg, "--json")) {
         try outputJson(a, io, now, hours, buckets);
@@ -403,7 +463,7 @@ test "learned ratio pools three valid windows and ignores tiny deltas" {
 test "stale windows clear 5h and roll weekly forward" {
     const rows = try parseLog(std.testing.allocator, "1 5h=80@18000 7d=70@604800\n");
     defer std.testing.allocator.free(rows);
-    const b = (try measure(std.testing.allocator, rows, specs[0], 3 * 604800 + 20, 24, 60)).sampled;
+    const b = (try measure(std.testing.allocator, rows, specs[0], 3 * 604800 + 20, 24, 60, 0)).sampled;
     try std.testing.expectEqual(@as(i64, 0), b.five_hour.used);
     try std.testing.expectEqual(@as(?i64, null), b.five_hour.resets_at);
     try std.testing.expectEqual(@as(i64, 0), b.weekly.used);
