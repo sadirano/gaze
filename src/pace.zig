@@ -522,5 +522,5 @@ test "inputs survive the cache round trip" {
     try tt.expectEqual(@as(u32, 9), back.profile.days);
     try tt.expectApproxEqAbs(in.profile.w[17], back.profile.w[17], 0.01);
     try tt.expect(decode("junk") == null);
-    try tt.expect(decode("0 1 0 " ++ "000" ** 24) == null);
+    try tt.expect(decode("0 1 0 " ++ @as([72]u8, @splat('0'))) == null);
 }

@@ -370,7 +370,7 @@ test "writeName keeps what is safe and replaces what is not" {
 
 test "writeName cuts an over-long bucket id" {
     var buf: [max_name_len]u8 = undefined;
-    const long = "x" ** (max_name_len + 10);
+    const long = &@as([max_name_len + 10]u8, @splat('x'));
     try std.testing.expectEqual(@as(usize, max_name_len), (try writeName(&buf, long)).len);
 }
 

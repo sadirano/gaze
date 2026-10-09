@@ -341,7 +341,7 @@ test "Codex names remain distinct and safe after gaze sanitizes them" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var names: [4][]const u8 = undefined;
-    for ([_][]const u8{ "a b", "a_b", "x" ** 40, "x" ** 39 ++ "y" }, 0..) |bucket, i| {
+    for ([_][]const u8{ "a b", "a_b", &@as([40]u8, @splat('x')), &(@as([39]u8, @splat('x')) ++ "y".*) }, 0..) |bucket, i| {
         names[i] = try windowName(arena.allocator(), bucket, "primary", 300);
         var buf: [32]u8 = undefined;
         try std.testing.expectEqualStrings(names[i], try quota.writeName(&buf, names[i]));

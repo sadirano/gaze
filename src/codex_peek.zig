@@ -448,4 +448,3 @@ test "refresh files a sample under Codex's time and never moves the log back" {
     const kept = try tmp.dir.readFileAlloc(io, "q/quota-codex.log", g, .limited(4096));
     try std.testing.expectEqualStrings("1789900000\t5h=96@1789943916\t7d=15@1790530716\n", kept);
 }
-

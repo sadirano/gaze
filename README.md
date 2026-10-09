@@ -25,7 +25,7 @@ or `$HOME/gaze`.
 
 ## Install
 
-You need [Zig 0.16](https://ziglang.org/download/).
+You need [Zig 0.17](https://ziglang.org/download/).
 
 ```
 zig build -Doptimize=ReleaseFast
