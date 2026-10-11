@@ -13,6 +13,23 @@ const chunk_size = 64 * 1024;
 pub const Stat = struct { source: []const u8, added: usize, skipped: usize, offset: u64 };
 pub const Version = enum { missing, current, old, newer };
 
+/// stdout as Zig must drive it. Git Bash (MSYS) hands over a pipe handle
+/// opened for overlapped I/O: a write into a full pipe returns PENDING, which
+/// Zig's synchronous path treats as unreachable (`| head`, or any reader
+/// slower than ~64 KB). Such a handle is written through Zig's asynchronous
+/// path, which waits for the write to complete.
+pub fn stdout() Io.File {
+    var file = Io.File.stdout();
+    if (@import("builtin").os.tag == .windows) {
+        const windows = std.os.windows;
+        var iosb: windows.IO_STATUS_BLOCK = undefined;
+        var mode: windows.FILE.MODE = @bitCast(@as(u32, 0));
+        const status = windows.ntdll.NtQueryInformationFile(file.handle, &iosb, &mode, @sizeOf(windows.FILE.MODE), .Mode);
+        if (status == .SUCCESS and mode.IO == .ASYNCHRONOUS) file.flags.nonblocking = true;
+    }
+    return file;
+}
+
 fn path(a: Allocator, dir: []const u8, name: []const u8) ![]const u8 {
     return std.fs.path.join(a, &.{ dir, name });
 }
@@ -331,7 +348,7 @@ pub fn rows(a: Allocator, io: Io, db: *sqlite.Db, source: []const u8, since: ?i6
         }
         try windows.reset();
         try line.writer.writeAll("}}\n");
-        try Io.File.stdout().writeStreamingAll(io, line.written());
+        try stdout().writeStreamingAll(io, line.written());
     }
 }
 
@@ -367,7 +384,7 @@ pub fn query(a: Allocator, io: Io, db: *sqlite.Db, sql: []const u8) !void {
         try appendTsv(a, &line, stmt.columnName(@intCast(i)));
     }
     try line.append(a, '\n');
-    try Io.File.stdout().writeStreamingAll(io, line.items);
+    try stdout().writeStreamingAll(io, line.items);
     while (try stmt.step() == .row) {
         line.clearRetainingCapacity();
         for (0..@intCast(count)) |i| {
@@ -376,7 +393,7 @@ pub fn query(a: Allocator, io: Io, db: *sqlite.Db, sql: []const u8) !void {
             try appendTsv(a, &line, if (stmt.columnIsNull(col)) null else stmt.columnText(col) orelse "");
         }
         try line.append(a, '\n');
-        try Io.File.stdout().writeStreamingAll(io, line.items);
+        try stdout().writeStreamingAll(io, line.items);
     }
 }
 

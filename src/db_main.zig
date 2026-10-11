@@ -5,11 +5,18 @@ const report = @import("quota_report.zig");
 const cache = @import("cache.zig");
 
 const usage = "usage: gaze-db sync|rebuild|rows <source> [--since TS] [--until TS] [--stale]|query <SQL> [--stale]\n";
+const stdout = db.stdout;
 
 fn fail(io: Io, code: u8, reason: []const u8) noreturn {
     Io.File.stderr().writeStreamingAll(io, reason) catch {};
     Io.File.stderr().writeStreamingAll(io, "\n") catch {};
     std.process.exit(code);
+}
+
+/// A reader that closed early (`| head`) got what it wanted.
+fn outputFailed(io: Io, a: std.mem.Allocator, err: anyerror) noreturn {
+    if (err == error.BrokenPipe) std.process.exit(0);
+    fail(io, 4, std.fmt.allocPrint(a, "query failed: {s}", .{@errorName(err)}) catch "query failed");
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -53,7 +60,7 @@ pub fn main(init: std.process.Init) !void {
         break :blk &.{};
     };
     if (is_sync) {
-        for (stats) |stat| try Io.File.stdout().writeStreamingAll(io, try std.fmt.allocPrint(a, "{s} +{d} skipped={d} offset={d}\n", .{ stat.source, stat.added, stat.skipped, stat.offset }));
+        for (stats) |stat| stdout().writeStreamingAll(io, try std.fmt.allocPrint(a, "{s} +{d} skipped={d} offset={d}\n", .{ stat.source, stat.added, stat.skipped, stat.offset })) catch |err| outputFailed(io, a, err);
         return;
     }
     if (is_rebuild) return;
@@ -68,9 +75,9 @@ pub fn main(init: std.process.Init) !void {
         try Io.File.stderr().writeStreamingAll(io, try std.fmt.allocPrint(a, "stale: sync failed ({s}); data as of {s}\n", .{ @errorName(err), as_of }));
     }
     if (is_rows) {
-        db.rows(a, io, &reader, args[2], since, until) catch |err| fail(io, 4, try std.fmt.allocPrint(a, "query failed: {s}", .{@errorName(err)}));
+        db.rows(a, io, &reader, args[2], since, until) catch |err| outputFailed(io, a, err);
     } else {
-        db.query(a, io, &reader, args[2]) catch |err| fail(io, 4, try std.fmt.allocPrint(a, "query failed: {s}", .{@errorName(err)}));
+        db.query(a, io, &reader, args[2]) catch |err| outputFailed(io, a, err);
     }
 }
 
