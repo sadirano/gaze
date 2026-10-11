@@ -14,6 +14,7 @@ pub const usage =
     \\  gaze quota --brief         one line per bucket, for agents
     \\  gaze quota --json          full report as JSON
     \\  gaze quota --hours 16      active hours per day (default 24 or QUOTA_ACTIVE_HOURS)
+    \\QUOTA_PLAN_<TOOL>=<days>d:<pct>  reach pct% of the weekly by day N, then pace the rest to the reset (e.g. QUOTA_PLAN_CODEX=4.5d:90)
     \\  -h, --help, --agent        this text
     \\
     \\GAZE_QUOTA_NOW overrides the Unix clock with integer seconds for testing.
@@ -42,6 +43,7 @@ const WindowJson = struct { used: i64, resets_at: ?i64, stale: bool };
 const WeeklyJson = struct { used: i64, resets_at: i64, stale: bool };
 const BlocksJson = struct { usable: f64, current: f64, after_current: f64, full: i64 };
 const RatioJson = struct { value: f64, source: []const u8, windows: usize };
+const PlanJson = struct { days: f64, target: f64, deadline: i64, phase: []const u8 };
 const Sampled = struct {
     id: []const u8,
     name: []const u8,
@@ -56,6 +58,8 @@ const Sampled = struct {
     will_expire: f64,
     verdict: []const u8,
     schedule: ?ScheduleJson,
+    plan_config: ?pace_mod.Plan = null,
+    plan: ?PlanJson = null,
 };
 /// The status line's glyphs and the numbers behind them, from the same
 /// evaluator. Null when the sample's week has reset (nothing to compare).
@@ -67,7 +71,7 @@ const ScheduleJson = struct {
     blocks: f64,
     profile_days: u32,
 };
-const Unsampled = struct { id: []const u8, name: []const u8, sampled: bool = false };
+const Unsampled = struct { id: []const u8, name: []const u8, sampled: bool = false, plan_config: ?pace_mod.Plan = null };
 const Bucket = union(enum) { sampled: Sampled, unsampled: Unsampled };
 
 fn digits(raw: []const u8) bool {
@@ -174,7 +178,7 @@ pub fn learnRatio(a: Allocator, rows: Rows, short: usize, weekly: usize) !Ratio 
     return .{ .value = if (ds == 0) null else @as(f64, @floatFromInt(dw)) / @as(f64, @floatFromInt(ds)), .windows = count };
 }
 
-fn verdictFor(remaining: i64, pace: ?f64, tight: f64) []const u8 {
+fn verdictFor(remaining: f64, pace: ?f64, tight: f64) []const u8 {
     if (remaining <= 0) return "spent";
     const p = pace orelse return "will_expire";
     if (p > 100) return "will_expire";
@@ -182,9 +186,10 @@ fn verdictFor(remaining: i64, pace: ?f64, tight: f64) []const u8 {
     return "ok";
 }
 
-fn schedule(a: Allocator, rows: Rows, spec: Spec, row: Row, now: i64, hours: f64, offset: i64) !?ScheduleJson {
+fn schedule(a: Allocator, rows: Rows, spec: Spec, row: Row, now: i64, hours: f64, offset: i64, plan: ?pace_mod.Plan) !?ScheduleJson {
     var in = try pace_mod.learn(a, rows, spec, now, offset);
     in.hours = hours;
+    in.plan = plan;
     const wl = row.fields[spec.weekly].?;
     const sl = row.fields[spec.short].?;
     const short: pace_mod.Level = .{ .used = sl.pct, .reset = sl.reset };
@@ -200,6 +205,10 @@ fn schedule(a: Allocator, rows: Rows, spec: Spec, row: Row, now: i64, hours: f64
 }
 
 fn measure(a: Allocator, rows: Rows, spec: Spec, now: i64, hours: f64, tight: f64, offset: i64) !Bucket {
+    return measureWithPlan(a, rows, spec, now, hours, tight, offset, null);
+}
+
+fn measureWithPlan(a: Allocator, rows: Rows, spec: Spec, now: i64, hours: f64, tight: f64, offset: i64, configured: ?pace_mod.Plan) !Bucket {
     var latest: ?Row = null;
     var i = rows.len;
     while (i > 0) {
@@ -209,7 +218,7 @@ fn measure(a: Allocator, rows: Rows, spec: Spec, now: i64, hours: f64, tight: f6
             break;
         }
     }
-    const row = latest orelse return .{ .unsampled = .{ .id = spec.id, .name = spec.name } };
+    const row = latest orelse return .{ .unsampled = .{ .id = spec.id, .name = spec.name, .plan_config = configured } };
     const s = row.fields[spec.short].?;
     const w = row.fields[spec.weekly].?;
     const s_stale = s.reset <= now;
@@ -223,12 +232,35 @@ fn measure(a: Allocator, rows: Rows, spec: Spec, now: i64, hours: f64, tight: f6
     const ratio = if (learned) learned_ratio.value.? else spec.fallback;
     const cur_end = if (s_stale) now else s.reset;
     const cur_cap: f64 = if (s_stale) 0 else @as(f64, @floatFromInt(100 - s_pct)) / 100;
-    const full = @max(0, @divFloor(w_reset - cur_end, five_h));
-    const usable = @min(@as(f64, @floatFromInt(full)), @max(0, @as(f64, @floatFromInt(w_reset - cur_end)) / 86400) * hours / 5);
+    var active_plan: ?PlanJson = null;
+    var endpoint = w_reset;
+    var remaining: f64 = @floatFromInt(100 - w_pct);
+    if (configured) |plan| if (!w_stale) {
+        if (pace_mod.deadline(w.reset, plan)) |end| {
+            const profile = (try pace_mod.learn(a, rows, spec, now, offset)).profile;
+            const phase_start = if (now < end) w.reset - week else end;
+            const phase_end = if (now < end) end else w.reset;
+            const duration = profile.active(offset, phase_start, phase_end);
+            if (std.math.isFinite(duration) and duration > 0) {
+                active_plan = .{ .days = plan.days, .target = plan.target, .deadline = end, .phase = if (now < end) "plan" else "remainder" };
+                if (now < end) {
+                    endpoint = end;
+                    remaining = @max(0, plan.target - @as(f64, @floatFromInt(w_pct)));
+                }
+            }
+        }
+    };
+    const after_start = @min(@max(cur_end, now), endpoint);
+    const full = @max(0, @divFloor(endpoint - after_start, five_h));
+    const usable = if (after_start == endpoint) 0 else @min(@as(f64, @floatFromInt(full)), @max(0, @as(f64, @floatFromInt(endpoint - after_start)) / 86400) * hours / 5);
     const blocks = cur_cap + usable;
-    const remaining = 100 - w_pct;
     const spendable = blocks * 100 * ratio;
-    const pace: ?f64 = if (blocks > 0 and ratio != 0) @as(f64, @floatFromInt(remaining)) / (ratio * blocks) else null;
+    const pace: ?f64 = if (active_plan != null and now < active_plan.?.deadline and remaining == 0) 0 else if (blocks > 0 and ratio != 0) remaining / (ratio * blocks) else null;
+    if (active_plan != null and (!std.math.isFinite(remaining) or !std.math.isFinite(blocks) or !std.math.isFinite(spendable) or (pace != null and !std.math.isFinite(pace.?)))) {
+        var fallback = try measureWithPlan(a, rows, spec, now, hours, tight, offset, null);
+        fallback.sampled.plan_config = configured;
+        return fallback;
+    }
     return .{ .sampled = .{
         .id = spec.id,
         .name = spec.name,
@@ -239,9 +271,11 @@ fn measure(a: Allocator, rows: Rows, spec: Spec, now: i64, hours: f64, tight: f6
         .ratio = .{ .value = rounded(ratio, 10000), .source = if (learned) "learned" else "default", .windows = learned_ratio.windows },
         .pace = if (pace) |p| rounded(p, 10) else null,
         .max_spendable = rounded(spendable, 10),
-        .will_expire = rounded(@max(0, @as(f64, @floatFromInt(remaining)) - spendable), 10),
-        .verdict = verdictFor(remaining, pace, tight),
-        .schedule = try schedule(a, rows, spec, row, now, hours, offset),
+        .will_expire = rounded(@max(0, remaining - spendable), 10),
+        .verdict = if (active_plan != null and now < active_plan.?.deadline and @as(f64, @floatFromInt(w_pct)) >= configured.?.target and w_pct < 100) "target_met" else verdictFor(remaining, pace, tight),
+        .schedule = try schedule(a, rows, spec, row, now, hours, offset, configured),
+        .plan_config = configured,
+        .plan = active_plan,
     } };
 }
 
@@ -257,8 +291,17 @@ fn outputJson(a: Allocator, io: Io, now: i64, hours: f64, buckets: [4]Bucket) !v
     try out.writeStreamingAll(io, head);
     for (buckets, 0..) |bucket, i| {
         const data = switch (bucket) {
-            .sampled => |s| try std.json.Stringify.valueAlloc(a, s, .{}),
-            .unsampled => |u| try std.json.Stringify.valueAlloc(a, u, .{}),
+            .sampled => |s| blk: {
+                const base = try std.json.Stringify.valueAlloc(a, .{ .id = s.id, .name = s.name, .sampled = s.sampled, .sample_age_s = s.sample_age_s, .five_hour = s.five_hour, .weekly = s.weekly, .blocks = s.blocks, .ratio = s.ratio, .pace = s.pace, .max_spendable = s.max_spendable, .will_expire = s.will_expire, .verdict = s.verdict, .schedule = s.schedule }, .{});
+                if (s.plan_config == null) break :blk base;
+                const plan = try std.json.Stringify.valueAlloc(a, s.plan, .{});
+                break :blk try std.fmt.allocPrint(a, "{s},\"plan\":{s}}}", .{ base[0 .. base.len - 1], plan });
+            },
+            .unsampled => |u| blk: {
+                const base = try std.json.Stringify.valueAlloc(a, .{ .id = u.id, .name = u.name, .sampled = u.sampled }, .{});
+                if (u.plan_config == null) break :blk base;
+                break :blk try std.fmt.allocPrint(a, "{s},\"plan\":null}}", .{base[0 .. base.len - 1]});
+            },
         };
         try out.writeStreamingAll(io, "    ");
         try out.writeStreamingAll(io, data);
@@ -303,11 +346,15 @@ fn scheduleText(a: Allocator, color: bool, s: Sampled) ![]const u8 {
 fn outputBrief(a: Allocator, io: Io, buckets: [4]Bucket) !void {
     for (buckets) |bucket| {
         const line = switch (bucket) {
-            .unsampled => |u| try std.fmt.allocPrint(a, "{s} no-samples\n", .{u.id}),
-            .sampled => |s| if (s.schedule) |sc|
-                try std.fmt.allocPrint(a, "{s} 5h={d}% wk={d}% pace={s} {s} sched={s} 5hsched={s} delta={d:.0}\n", .{ s.id, s.five_hour.used, s.weekly.used, try paceText(a, s.pace), s.verdict, sc.weekly_glyph, sc.five_hour_glyph orelse ".", sc.delta })
-            else
-                try std.fmt.allocPrint(a, "{s} 5h={d}% wk={d}% pace={s} {s}\n", .{ s.id, s.five_hour.used, s.weekly.used, try paceText(a, s.pace), s.verdict }),
+            .unsampled => |u| try std.fmt.allocPrint(a, "{s} no-samples{s}\n", .{ u.id, if (u.plan_config != null) " plan=unavailable" else "" }),
+            .sampled => |s| blk: {
+                const suffix = if (s.plan_config) |plan| if (s.plan) |p|
+                    try std.fmt.allocPrint(a, " plan={d}%@{d}d:{s}", .{ plan.target, plan.days, p.phase })
+                else
+                    " plan=unavailable" else "";
+                if (s.schedule) |sc| break :blk try std.fmt.allocPrint(a, "{s} 5h={d}% wk={d}% pace={s} {s} sched={s} 5hsched={s} delta={d:.0}{s}\n", .{ s.id, s.five_hour.used, s.weekly.used, try paceText(a, s.pace), s.verdict, sc.weekly_glyph, sc.five_hour_glyph orelse ".", sc.delta, suffix });
+                break :blk try std.fmt.allocPrint(a, "{s} 5h={d}% wk={d}% pace={s} {s}{s}\n", .{ s.id, s.five_hour.used, s.weekly.used, try paceText(a, s.pace), s.verdict, suffix });
+            },
         };
         try Io.File.stdout().writeStreamingAll(io, line);
     }
@@ -377,17 +424,31 @@ fn outputTable(a: Allocator, io: Io, now: i64, hours: f64, buckets: [4]Bucket, c
         switch (bucket) {
             .unsampled => |u| {
                 try Io.File.stdout().writeStreamingAll(io, try std.fmt.allocPrint(a, "\n{s}  {s}\n", .{ try colorize(a, color, "1", u.name), try colorize(a, color, "2", "no samples") }));
+                if (u.plan_config != null) try Io.File.stdout().writeStreamingAll(io, "  plan    unavailable (no sample in this week)\n");
             },
             .sampled => |s| {
                 const age = @divFloor(s.sample_age_s, 60);
                 const when = if (s.five_hour.stale) "window reset since sample" else try std.fmt.allocPrint(a, "resets {s} (in {s})", .{ try fmtAt(a, s.five_hour.resets_at.?, offset), try fmtLeft(a, s.five_hour.resets_at.? - now) });
                 const s_color: []const u8 = if (s.five_hour.used >= 90) "31" else if (s.five_hour.used >= 60) "33" else "32";
                 const src = if (std.mem.eql(u8, s.ratio.source, "learned")) try std.fmt.allocPrint(a, "learned from {d} windows", .{s.ratio.windows}) else "default, too little history";
-                const remaining = 100 - s.weekly.used;
-                const verdict = if (std.mem.eql(u8, s.verdict, "spent")) "weekly used up" else if (std.mem.eql(u8, s.verdict, "will_expire")) try std.fmt.allocPrint(a, "{d}% of weekly WILL expire even running every usable window flat out", .{@as(i64, @intFromFloat(halfEven(s.will_expire)))}) else if (std.mem.eql(u8, s.verdict, "tight")) "tight: needs most windows run hard to use it all" else "on track to use it all";
+                const remaining = if (s.plan) |p| if (std.mem.eql(u8, p.phase, "plan"))
+                    try std.fmt.allocPrint(a, "{d}", .{@max(0, p.target - @as(f64, @floatFromInt(s.weekly.used)))})
+                else
+                    try std.fmt.allocPrint(a, "{d}", .{100 - s.weekly.used}) else try std.fmt.allocPrint(a, "{d}", .{100 - s.weekly.used});
+                const in_plan = if (s.plan) |p| std.mem.eql(u8, p.phase, "plan") else false;
+                const verdict = if (std.mem.eql(u8, s.verdict, "target_met")) "plan target met" else if (std.mem.eql(u8, s.verdict, "spent")) "weekly used up" else if (std.mem.eql(u8, s.verdict, "will_expire")) try std.fmt.allocPrint(a, "{d}% {s} even running every usable window flat out", .{ @as(i64, @intFromFloat(halfEven(s.will_expire))), if (in_plan) "short of the plan target at the deadline" else "of weekly WILL expire" }) else if (std.mem.eql(u8, s.verdict, "tight")) (if (in_plan) "tight: needs most windows run hard to reach the plan target" else "tight: needs most windows run hard to use it all") else if (in_plan) "on track to reach the plan target" else "on track to use it all";
                 const v_color: []const u8 = if (std.mem.eql(u8, s.verdict, "will_expire")) "31" else if (std.mem.eql(u8, s.verdict, "tight")) "33" else "32";
-                const lines = try std.fmt.allocPrint(a, "\n{s}  {s}\n  5h      {s} {d: >3}%  {s}\n  weekly  {s} {d: >3}%  resets {s} (in {s})\n  blocks  {d:.1} left (current {d:.1} + {d:.1} of {d} full)   ratio {d:.3} weekly per 5h point ({s}); a full window = {d:.1}% weekly\n  pace    {s} of every remaining window to spend the {d}% left (max spendable {d}%)  {s}\n", .{ try colorize(a, color, "1", s.name), try colorize(a, color, "2", try std.fmt.allocPrint(a, "sampled {d} min ago", .{age})), try colorize(a, color, s_color, try bar(a, s.five_hour.used)), @as(u64, @intCast(@max(0, s.five_hour.used))), when, try colorize(a, color, "36", try bar(a, s.weekly.used)), @as(u64, @intCast(@max(0, s.weekly.used))), try fmtAt(a, s.weekly.resets_at, offset), try fmtLeft(a, s.weekly.resets_at - now), s.blocks.usable, s.blocks.current, s.blocks.after_current, s.blocks.full, s.ratio.value, src, 100 * s.ratio.value, try colorize(a, color, v_color, try paceText(a, s.pace)), remaining, @as(i64, @intFromFloat(halfEven(@min(s.max_spendable, 999)))), try colorize(a, color, v_color, verdict) });
-                try Io.File.stdout().writeStreamingAll(io, lines);
+                const head = try std.fmt.allocPrint(a, "\n{s}  {s}\n  5h      {s} {d: >3}%  {s}\n  weekly  {s} {d: >3}%  resets {s} (in {s})\n", .{ try colorize(a, color, "1", s.name), try colorize(a, color, "2", try std.fmt.allocPrint(a, "sampled {d} min ago", .{age})), try colorize(a, color, s_color, try bar(a, s.five_hour.used)), @as(u64, @intCast(@max(0, s.five_hour.used))), when, try colorize(a, color, "36", try bar(a, s.weekly.used)), @as(u64, @intCast(@max(0, s.weekly.used))), try fmtAt(a, s.weekly.resets_at, offset), try fmtLeft(a, s.weekly.resets_at - now) });
+                const tail = try std.fmt.allocPrint(a, "  blocks  {d:.1} left (current {d:.1} + {d:.1} of {d} full)   ratio {d:.3} weekly per 5h point ({s}); a full window = {d:.1}% weekly\n  pace    {s} of every remaining window to spend the {s}% left (max spendable {d}%)  {s}\n", .{ s.blocks.usable, s.blocks.current, s.blocks.after_current, s.blocks.full, s.ratio.value, src, 100 * s.ratio.value, try colorize(a, color, v_color, try paceText(a, s.pace)), remaining, @as(i64, @intFromFloat(halfEven(@min(s.max_spendable, 999)))), try colorize(a, color, v_color, verdict) });
+                try Io.File.stdout().writeStreamingAll(io, head);
+                if (s.plan_config) |plan| {
+                    const plan_line = if (s.plan) |p| if (std.mem.eql(u8, p.phase, "plan"))
+                        try std.fmt.allocPrint(a, "  plan    {d}% by {s} ({d}d)\n", .{ plan.target, try fmtAt(a, p.deadline, offset), plan.days })
+                    else
+                        try std.fmt.allocPrint(a, "  plan    {d}% by {s} passed; pacing the rest to the reset\n", .{ plan.target, try fmtAt(a, p.deadline, offset) }) else "  plan    unavailable (no sample in this week)\n";
+                    try Io.File.stdout().writeStreamingAll(io, plan_line);
+                }
+                try Io.File.stdout().writeStreamingAll(io, tail);
                 try Io.File.stdout().writeStreamingAll(io, try scheduleText(a, color, s));
             },
         }
@@ -424,7 +485,14 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     var buckets: [4]Bucket = undefined;
     for (specs, 0..) |spec, i| {
         const rows = if (i == 0) claude else if (i == 1) codex else agy;
-        buckets[i] = try measure(a, rows, spec, now, hours, if (hours >= 24) 60 else 85, offset);
+        const key = try planKey(a, spec.tool);
+        const raw = env.get(key);
+        const plan = pace_mod.planFrom(raw);
+        if (raw != null and plan == null) {
+            try Io.File.stderr().writeStreamingAll(io, try std.fmt.allocPrint(a, "quota: {s} must look like 4.5d:90, got '{s}'\n", .{ key, raw.? }));
+            std.process.exit(2);
+        }
+        buckets[i] = try measureWithPlan(a, rows, spec, now, hours, if (hours >= 24) 60 else 85, offset, plan);
     }
     for (args) |arg| if (std.mem.eql(u8, arg, "--json")) {
         try outputJson(a, io, now, hours, buckets);
@@ -437,6 +505,9 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     const no_color = env.get("NO_COLOR") != null;
     const color = !no_color and !contains(args, "--no-color") and (Io.File.stdout().isTty(io) catch false);
     try outputTable(a, io, now, hours, buckets, color);
+}
+pub fn planKey(a: Allocator, tool: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "QUOTA_PLAN_{s}", .{try std.ascii.allocUpperString(a, tool)});
 }
 fn contains(args: []const []const u8, needle: []const u8) bool {
     for (args) |arg| if (std.mem.eql(u8, arg, needle)) {
@@ -471,6 +542,25 @@ test "stale windows clear 5h and roll weekly forward" {
     try std.testing.expectEqual(@as(?i64, null), b.five_hour.resets_at);
     try std.testing.expectEqual(@as(i64, 0), b.weekly.used);
     try std.testing.expectEqual(@as(i64, 4 * 604800), b.weekly.resets_at);
+}
+
+test "report plan target and stale sample" {
+    const plan: pace_mod.Plan = .{ .days = 4.5, .target = 90 };
+    const start: i64 = 1790640000;
+    const rows = try parseLog(std.testing.allocator, "1790812800 5h=20@1790830800 7d=90@1791244800\n");
+    defer std.testing.allocator.free(rows);
+    const reached = (try measureWithPlan(std.testing.allocator, rows, specs[0], start + 2 * 86400, 24, 60, 0, plan)).sampled;
+    try std.testing.expectEqualStrings("target_met", reached.verdict);
+    try std.testing.expectEqual(@as(?f64, 0), reached.pace);
+    try std.testing.expectEqual(@as(f64, 0), reached.will_expire);
+    try std.testing.expectEqualStrings("plan", reached.plan.?.phase);
+    const fractional = (try measureWithPlan(std.testing.allocator, rows, specs[0], start + 2 * 86400, 24, 60, 0, .{ .days = 4.5, .target = 90.5 })).sampled;
+    try std.testing.expect(!std.mem.eql(u8, "spent", fractional.verdict));
+    try std.testing.expect(fractional.pace.? > 0);
+    const stale = (try measureWithPlan(std.testing.allocator, rows, specs[0], start + 8 * 86400, 24, 60, 0, plan)).sampled;
+    try std.testing.expect(stale.plan == null);
+    try std.testing.expect(stale.plan_config != null);
+    try std.testing.expectEqualStrings("ok", stale.verdict);
 }
 test "verdict boundaries" {
     try std.testing.expectEqualStrings("spent", verdictFor(0, null, 60));

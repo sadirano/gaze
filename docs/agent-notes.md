@@ -122,6 +122,12 @@ from the status-line render path (its log parser and ratio learner are, through
 
 ## Pace glyphs
 
+`QUOTA_PLAN_<TOOL>=<days>d:<pct>` sets a weekly target for Claude, Codex, or
+Agy (both allowances). Until the deadline, pace judges progress toward that
+percentage and capacity to the deadline. Afterward, it paces the rest toward
+the real reset. A plan never applies to a rolled-forward week whose logged
+reset has passed; `gaze quota` reports that plan unavailable.
+
 `src/pace.zig` is the one evaluator behind both the status line glyph and the
 `schedule` line of `gaze quota`. Never compute a glyph anywhere else.
 

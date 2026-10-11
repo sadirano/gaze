@@ -140,6 +140,36 @@ pub fn hoursFrom(raw: ?[]const u8) f64 {
     return if (h >= 1 and h <= 24) h else 24;
 }
 
+pub const Plan = struct { days: f64, target: f64 };
+
+fn decimal(raw: []const u8) ?f64 {
+    if (raw.len == 0) return null;
+    var dot = false;
+    for (raw, 0..) |c, i| {
+        if (c == '.') {
+            if (dot or i == 0 or i + 1 == raw.len) return null;
+            dot = true;
+        } else if (c < '0' or c > '9') return null;
+    }
+    return std.fmt.parseFloat(f64, raw) catch null;
+}
+
+pub fn planFrom(raw: ?[]const u8) ?Plan {
+    const s = std.mem.trim(u8, raw orelse return null, " \t\r\n\x0b\x0c");
+    const sep = std.mem.indexOf(u8, s, "d:") orelse return null;
+    const days = decimal(s[0..sep]) orelse return null;
+    const target = decimal(s[sep + 2 ..]) orelse return null;
+    if (!(days > 0 and days < 7 and target > 0 and target <= 100)) return null;
+    return .{ .days = days, .target = target };
+}
+
+pub fn deadline(reset: i64, plan: Plan) ?i64 {
+    if (!(plan.days > 0 and plan.days < 7 and plan.target > 0 and plan.target <= 100)) return null;
+    const start = reset - week;
+    const end = start + @as(i64, @intFromFloat(@round(plan.days * 86400)));
+    return if (end > start) end else null;
+}
+
 /// What the cache holds: the slow, history-derived inputs, never an answer that
 /// depends on the clock.
 pub const Inputs = struct {
@@ -150,6 +180,7 @@ pub const Inputs = struct {
     /// Hours a day available for spending (QUOTA_ACTIVE_HOURS). Configuration,
     /// not history, so it is set by the caller and never cached.
     hours: f64 = 24,
+    plan: ?Plan = null,
 };
 
 /// `<ratio x 1e4> <learned 0|1> <days> <24 three-digit weights>`, under the
@@ -277,9 +308,28 @@ fn running5h(s: ?Level, now: i64) ?Level {
 pub fn weekly(in: Inputs, offset: i64, w: Level, s: ?Level, now: i64) ?Weekly {
     if (w.reset <= now or w.reset > now + week or w.used < 0 or w.used > 100) return null;
     const start = w.reset - week;
-    const total = in.profile.active(offset, start, w.reset);
-    if (!(total > 0)) return null;
-    const expected = 100 * in.profile.active(offset, start, now) / total;
+    var endpoint = w.reset;
+    var expected: f64 = undefined;
+    var target: f64 = 100;
+    if (in.plan) |plan| {
+        if (deadline(w.reset, plan)) |end| {
+            if (now < end) {
+                const duration = in.profile.active(offset, start, end);
+                if (!std.math.isFinite(duration) or !(duration > 0)) return null;
+                expected = plan.target * in.profile.active(offset, start, now) / duration;
+                target = plan.target;
+                endpoint = end;
+            } else {
+                const duration = in.profile.active(offset, end, w.reset);
+                if (!std.math.isFinite(duration) or !(duration > 0)) return null;
+                expected = plan.target + (100 - plan.target) * in.profile.active(offset, end, now) / duration;
+            }
+        } else return null;
+    } else {
+        const total = in.profile.active(offset, start, w.reset);
+        if (!(total > 0)) return null;
+        expected = 100 * in.profile.active(offset, start, now) / total;
+    }
     const used: f64 = @floatFromInt(w.used);
     const delta = used - expected;
     const c = 100 * in.ratio;
@@ -289,13 +339,15 @@ pub fn weekly(in: Inputs, offset: i64, w: Level, s: ?Level, now: i64) ?Weekly {
     const cur_end = if (cur) |l| l.reset else now;
     // A window can start with less than five hours left and still spend, so the
     // last partial one counts, but never more windows than active time allows.
-    const span = @max(0, w.reset - cur_end);
+    const after_start = @min(@max(cur_end, now), endpoint);
+    const span = @max(0, endpoint - after_start);
     const opportunities: f64 = @floatFromInt(@divFloor(span + five_h - 1, five_h));
     const avail = in.profile.availability(in.hours);
-    const after = @min(opportunities, avail.active(offset, cur_end, w.reset) / @as(f64, @floatFromInt(five_h)));
+    const after = if (after_start == endpoint) 0 else @min(opportunities, avail.active(offset, after_start, endpoint) / @as(f64, @floatFromInt(five_h)));
     const blocks = cur_cap + after;
 
-    const remaining = 100 - used;
+    const remaining = @max(0, target - used);
+    if (!std.math.isFinite(expected) or !std.math.isFinite(blocks) or !std.math.isFinite(c) or !std.math.isFinite(delta)) return null;
     const glyph: Glyph = if (remaining > c * @max(blocks - 1, 0))
         .behind_warn
     else if (delta > c)
@@ -507,6 +559,44 @@ test "QUOTA_ACTIVE_HOURS out of range is the wall clock" {
     try tt.expectEqual(@as(f64, 24), hoursFrom(null));
     try tt.expectEqual(@as(f64, 24), hoursFrom("0"));
     try tt.expectEqual(@as(f64, 24), hoursFrom("abc"));
+}
+
+test "weekly plan parser accepts only bounded unsigned decimals" {
+    const p = planFrom("4.5d:90").?;
+    try tt.expectEqual(@as(f64, 4.5), p.days);
+    try tt.expectEqual(@as(f64, 90), p.target);
+    try tt.expectEqual(@as(f64, 4.5), planFrom(" 4.5d:90 ").?.days);
+    try tt.expect(planFrom(null) == null);
+    for ([_][]const u8{ "", "0d:90", "7d:90", "4.5d:0", "4.5d:101", "4.5d:90x", "-1d:90", "4.5d:nan", "1e0d:90" }) |raw| {
+        try tt.expect(planFrom(raw) == null);
+    }
+}
+
+test "weekly plan phases and lead glyphs" {
+    var in = flat(0.125);
+    in.plan = .{ .days = 4.5, .target = 90 };
+    const w: Level = .{ .used = 40, .reset = monday + week };
+    try tt.expectApproxEqAbs(@as(f64, 40), weekly(in, 0, w, null, monday + 2 * 86400).?.expected, 1e-9);
+    try tt.expectEqual(Glyph.even, weekly(in, 0, w, null, monday + 2 * 86400).?.glyph);
+    try tt.expectApproxEqAbs(@as(f64, 60), weekly(in, 0, w, null, monday + 3 * 86400).?.expected, 1e-9);
+    try tt.expectEqual(Glyph.ahead, weekly(in, 0, .{ .used = 67, .reset = w.reset }, null, monday + 3 * 86400).?.glyph);
+    try tt.expectEqual(Glyph.ahead_warn, weekly(in, 0, .{ .used = 90, .reset = w.reset }, null, monday + 2 * 86400).?.glyph);
+    try tt.expectEqual(Glyph.ahead, weekly(in, 0, .{ .used = 90, .reset = w.reset }, null, monday + 4 * 86400).?.glyph);
+    try tt.expectApproxEqAbs(@as(f64, 92), weekly(in, 0, .{ .used = 92, .reset = w.reset }, null, monday + 5 * 86400).?.expected, 1e-9);
+}
+
+test "weekly plan capacity stops at deadline and guards empty phase" {
+    var in = flat(0.125);
+    in.plan = .{ .days = 4.5, .target = 90 };
+    const reset = monday + week;
+    const end = deadline(reset, in.plan.?).?;
+    const current: Level = .{ .used = 60, .reset = end + hour };
+    const at = weekly(in, 0, .{ .used = 80, .reset = reset }, current, end - hour).?;
+    try tt.expectApproxEqAbs(@as(f64, 0.4), at.blocks, 1e-9);
+    try tt.expectEqual(Glyph.behind, weekly(in, 0, .{ .used = 65, .reset = reset }, null, end - 15 * hour).?.glyph);
+    try tt.expectEqual(Glyph.behind_warn, weekly(in, 0, .{ .used = 64, .reset = reset }, null, end - 15 * hour).?.glyph);
+    in.profile.w = @splat(0);
+    try tt.expect(weekly(in, 0, .{ .used = 40, .reset = reset }, null, monday + 2 * 86400) == null);
 }
 
 test "inputs survive the cache round trip" {

@@ -62,6 +62,7 @@ const usage =
     \\rest cannot be spent; weekly `++` means ahead by more than a window's worth.
     \\5h `++` means past half and more than 10 points ahead. Weekly "even" runs on
     \\active hours learned from the log; `gaze quota` shows the numbers behind it.
+    \\A configured weekly plan moves the weekly even-burn target.
     \\
     \\Every OTHER source's level is shown too, read from its own log, as the
     \\percentage USED - so free quota somewhere else is a glance rather than a
@@ -434,7 +435,7 @@ fn render(
     const source = cfg.source orelse q.source;
     const quota_dir = quotaDir(arena, env);
     var glyphs: [quota_mod.max_windows]?pace.Glyph = @splat(null);
-    if (cfg.pace) paceGlyphs(arena, io, quota_dir, tmpDir(env), source, q.windows, cfg.pace_ttl_s, pace.hoursFrom(env.get("QUOTA_ACTIVE_HOURS")), now, &glyphs);
+    if (cfg.pace) paceGlyphs(arena, io, quota_dir, tmpDir(env), env, source, q.windows, cfg.pace_ttl_s, pace.hoursFrom(env.get("QUOTA_ACTIVE_HOURS")), now, &glyphs);
     // One segment per allowance, labelled when there is more than one to tell
     // apart. Antigravity meters a Claude model and a Gemini model separately, so
     // a bare row of four percentages would say nothing about which is which.
@@ -489,7 +490,7 @@ fn render(
                 level.pct,
             }));
             if (cfg.peer_pace and cfg.pace) {
-                if (peerGlyph(arena, io, quota_dir, tmpDir(env), peer.source, level.group, cfg.pace_ttl_s, pace.hoursFrom(env.get("QUOTA_ACTIVE_HOURS")), now)) |g| {
+                if (peerGlyphWithEnv(arena, io, quota_dir, tmpDir(env), env, peer.source, level.group, cfg.pace_ttl_s, pace.hoursFrom(env.get("QUOTA_ACTIVE_HOURS")), now)) |g| {
                     try line.color(glyphCode(g), g.text());
                 }
             }
@@ -645,11 +646,17 @@ fn glyphCode(g: pace.Glyph) []const u8 {
 /// uncertain, and the number already carries the `~`: the peer can only have
 /// spent more since, so `-` may overstate how far behind it is, while `+` is
 /// at least that far ahead.
-fn peerGlyph(
+fn peerGlyph(arena: std.mem.Allocator, io: Io, quota_dir: []const u8, tmp_dir: []const u8, source: []const u8, group: []const u8, ttl_s: u32, hours: f64, now: i64) ?pace.Glyph {
+    var env: std.process.Environ.Map = .init(arena);
+    return peerGlyphWithEnv(arena, io, quota_dir, tmp_dir, &env, source, group, ttl_s, hours, now);
+}
+
+fn peerGlyphWithEnv(
     arena: std.mem.Allocator,
     io: Io,
     quota_dir: []const u8,
     tmp_dir: []const u8,
+    env: *const std.process.Environ.Map,
     source: []const u8,
     group: []const u8,
     ttl_s: u32,
@@ -668,6 +675,7 @@ fn peerGlyph(
         const short: ?pace.Level = if (last.fields[spec.short]) |sp| .{ .used = sp.pct, .reset = sp.reset } else null;
         var in = pace.cachedInputs(arena, io, quota_dir, tmp_dir, spec, ttl_s, now, offset) orelse continue;
         in.hours = hours;
+        in.plan = pace.planFrom(env.get(quota_report.planKey(arena, spec.tool) catch continue));
         const r = pace.weekly(in, offset, .{ .used = wp.pct, .reset = wp.reset }, short, now) orelse continue;
         if (std.mem.eql(u8, quota_mod.groupOf(quota_report.names[spec.weekly]), group)) return r.glyph;
         if (only == null) only = r.glyph;
@@ -695,6 +703,7 @@ fn paceGlyphs(
     io: Io,
     quota_dir: []const u8,
     tmp_dir: []const u8,
+    env: *const std.process.Environ.Map,
     source: []const u8,
     windows: []const quota_mod.Window,
     ttl_s: u32,
@@ -714,6 +723,7 @@ fn paceGlyphs(
         const w = levelOf(windows[i]) orelse continue;
         var in = pace.cachedInputs(arena, io, quota_dir, tmp_dir, spec, ttl_s, now, offset) orelse continue;
         in.hours = hours;
+        in.plan = pace.planFrom(env.get(quota_report.planKey(arena, spec.tool) catch continue));
         if (pace.weekly(in, offset, w, short, now)) |r| out[i] = r.glyph;
     }
 }
