@@ -157,6 +157,11 @@ sure it also fails towards "say less" rather than "guess".
 
 ## Changing the rendered line
 
+The cached-token segment shows a countdown to the prompt-cache expiry Claude
+Code reports when caching has been observed. A cold cache shows `cold`; the
+countdown describes the reported expiry, not a promise that the next request
+will hit the cache.
+
 The unit tests cover the formatting helpers (cost grouping, token suffixes,
 duration units, the alias-relative path, HEAD parsing, cache staleness). They do
 not cover the assembled line.

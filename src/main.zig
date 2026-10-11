@@ -63,6 +63,7 @@ const usage =
     \\5h `++` means past half and more than 10 points ahead. Weekly "even" runs on
     \\active hours learned from the log; `gaze quota` shows the numbers behind it.
     \\A configured weekly plan moves the weekly even-burn target.
+    \\The cached-token segment also shows Claude Code's prompt-cache expiry countdown.
     \\
     \\Every OTHER source's level is shown too, read from its own log, as the
     \\percentage USED - so free quota somewhere else is a glance rather than a
@@ -508,9 +509,30 @@ fn render(
     const cr = whole(numAt(root, &.{ "context_window", "current_usage", "cache_read_input_tokens" })) orelse 0;
     const cc = whole(numAt(root, &.{ "context_window", "current_usage", "cache_creation_input_tokens" })) orelse 0;
     const cached = cr + cc;
+    var cache_state: ?CacheState = null;
+    if (boolAt(root, &.{ "prompt_cache", "caching_observed" }) == true) {
+        if (boolAt(root, &.{ "prompt_cache", "warm" })) |warm| {
+            if (!warm) {
+                cache_state = cacheLeft(now, now, null);
+            } else if (whole(numAt(root, &.{ "prompt_cache", "expires_at" }))) |expires_at| {
+                if (expires_at > 0) {
+                    const ttl = if (strAt(root, &.{ "prompt_cache", "ttl" })) |raw| ttlSeconds(raw) else null;
+                    cache_state = cacheLeft(now, expires_at, ttl);
+                }
+            }
+        }
+    }
     if (cached > 0) {
         try line.seg();
         try line.color("90", try std.fmt.allocPrint(arena, "@{s}", .{try formatTokens(arena, cached)}));
+    }
+    if (cache_state) |state| {
+        if (cached > 0) {
+            try line.w.writeAll(" ");
+        } else {
+            try line.seg();
+        }
+        try line.color(state.color, state.text[0..state.len]);
     }
 
     // --- session cost, hidden below half a cent ---
@@ -752,6 +774,60 @@ fn timeLeft(arena: std.mem.Allocator, now: i64, unix: i64) ?[]const u8 {
         std.fmt.allocPrint(arena, "@{d}m", .{m}) catch null;
 }
 
+const CacheState = struct {
+    text: [32]u8 = undefined,
+    len: usize = 0,
+    color: []const u8,
+};
+
+fn ttlSeconds(raw: []const u8) ?i64 {
+    if (raw.len < 2) return null;
+    const unit: i64 = switch (raw[raw.len - 1]) {
+        'h' => 3600,
+        'm' => 60,
+        's' => 1,
+        else => return null,
+    };
+    var digits: i64 = 0;
+    for (raw[0 .. raw.len - 1]) |c| {
+        if (c < '0' or c > '9') return null;
+        digits = std.math.mul(i64, digits, 10) catch return null;
+        digits = std.math.add(i64, digits, c - '0') catch return null;
+    }
+    const seconds = std.math.mul(i64, digits, unit) catch return null;
+    return if (seconds > 0) seconds else null;
+}
+
+fn cacheLeft(now: i64, expires_at: i64, ttl_s: ?i64) ?CacheState {
+    const remaining = std.math.sub(i64, expires_at, now) catch return null;
+    var state: CacheState = .{ .color = "90" };
+    const text = if (remaining <= 0) blk: {
+        state.color = "31";
+        break :blk std.fmt.bufPrint(&state.text, "cold", .{}) catch return null;
+    } else blk: {
+        if (ttl_s) |ttl| {
+            if (ttl > 0) {
+                const left: i128 = remaining;
+                const total: i128 = ttl;
+                if (100 * left < 5 * total) {
+                    state.color = "31";
+                } else if (100 * left < 20 * total) {
+                    state.color = "33";
+                }
+            }
+        }
+        if (remaining >= 3600) {
+            break :blk std.fmt.bufPrint(&state.text, "{d}h{d}m", .{ @divTrunc(remaining, 3600), @divTrunc(@rem(remaining, 3600), 60) }) catch return null;
+        } else if (remaining >= 60) {
+            break :blk std.fmt.bufPrint(&state.text, "{d}m", .{@divTrunc(remaining, 60)}) catch return null;
+        } else {
+            break :blk std.fmt.bufPrint(&state.text, "{d}s", .{remaining}) catch return null;
+        }
+    };
+    state.len = text.len;
+    return state;
+}
+
 /// "$1,234.50" - comma-grouped to match what the shell ports rendered, since a
 /// long-running session's cost is easier to read at a glance with the grouping.
 /// Always ASCII, never locale-dependent, so it looks the same on any machine.
@@ -910,6 +986,14 @@ fn strAt(root: std.json.Value, path: []const []const u8) ?[]const u8 {
     };
 }
 
+fn boolAt(root: std.json.Value, path: []const []const u8) ?bool {
+    const v = at(root, path) orelse return null;
+    return switch (v) {
+        .bool => |b| b,
+        else => null,
+    };
+}
+
 fn numAt(root: std.json.Value, path: []const []const u8) ?f64 {
     const v = at(root, path) orelse return null;
     return switch (v) {
@@ -1020,6 +1104,51 @@ test "formatDuration picks the coarsest useful unit" {
     try std.testing.expectEqualStrings("8s", try formatDuration(g, 8200));
     try std.testing.expectEqualStrings("47m", try formatDuration(g, 2_820_000));
     try std.testing.expectEqualStrings("1h15m", try formatDuration(g, 4_530_000));
+}
+
+test "ttlSeconds accepts positive supported durations only" {
+    const cases = .{
+        .{ "1h", @as(?i64, 3600) },
+        .{ "5m", @as(?i64, 300) },
+        .{ "30s", @as(?i64, 30) },
+        .{ "", @as(?i64, null) },
+        .{ "1d", @as(?i64, null) },
+        .{ "h", @as(?i64, null) },
+        .{ "-5m", @as(?i64, null) },
+        .{ "1.5h", @as(?i64, null) },
+        .{ "0s", @as(?i64, null) },
+        .{ "0h", @as(?i64, null) },
+        .{ "99999999999999999999h", @as(?i64, null) },
+        .{ "9223372036854775807h", @as(?i64, null) },
+    };
+    inline for (cases) |case| try std.testing.expectEqual(case[1], ttlSeconds(case[0]));
+}
+
+fn expectCacheLeft(remaining: i64, ttl: ?i64, expected_text: []const u8, expected_color: []const u8) !void {
+    const state = cacheLeft(1000, 1000 + remaining, ttl).?;
+    try std.testing.expectEqualStrings(expected_text, state.text[0..state.len]);
+    try std.testing.expectEqualStrings(expected_color, state.color);
+}
+
+test "cacheLeft formats time and colors at exact TTL boundaries" {
+    try expectCacheLeft(3600, 3600, "1h0m", "90");
+    try expectCacheLeft(3599, 3600, "59m", "90");
+    try expectCacheLeft(720, 3600, "12m", "90");
+    try expectCacheLeft(719, 3600, "11m", "33");
+    try expectCacheLeft(180, 3600, "3m", "33");
+    try expectCacheLeft(179, 3600, "2m", "31");
+    try expectCacheLeft(59, 3600, "59s", "31");
+    try expectCacheLeft(0, 3600, "cold", "31");
+    try expectCacheLeft(-10, 3600, "cold", "31");
+    try expectCacheLeft(299, 300, "4m", "90");
+    try expectCacheLeft(60, 300, "1m", "90");
+    try expectCacheLeft(59, 300, "59s", "33");
+    try expectCacheLeft(15, 300, "15s", "33");
+    try expectCacheLeft(14, 300, "14s", "31");
+    try expectCacheLeft(100, null, "1m", "90");
+    try expectCacheLeft(100, 0, "1m", "90");
+    try expectCacheLeft(100, -5, "1m", "90");
+    try std.testing.expect(cacheLeft(std.math.minInt(i64), std.math.maxInt(i64), 3600) == null);
 }
 
 /// Parse a payload the way `main` does, for the collector tests.
@@ -1145,6 +1274,34 @@ test "render omits a Claude window the payload gave no level for" {
     try std.testing.expect(std.mem.indexOf(u8, out, "47%") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "0%") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, " / ") == null);
+}
+
+test "render gates the prompt-cache countdown on observed boolean state and valid expiry" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    var env: std.process.Environ.Map = .init(a.allocator());
+    const baseline = try testRender(a.allocator(), "{\"context_window\":{\"current_usage\":{\"cache_read_input_tokens\":1000}}}", &env);
+    try std.testing.expect(std.mem.indexOf(u8, baseline, "@1.0k") != null);
+
+    const ignored = .{
+        "{\"context_window\":{\"current_usage\":{\"cache_read_input_tokens\":1000}},\"prompt_cache\":{\"caching_observed\":false,\"warm\":false}}",
+        "{\"context_window\":{\"current_usage\":{\"cache_read_input_tokens\":1000}},\"prompt_cache\":{\"caching_observed\":true}}",
+        "{\"context_window\":{\"current_usage\":{\"cache_read_input_tokens\":1000}},\"prompt_cache\":{\"caching_observed\":true,\"warm\":\"yes\"}}",
+        "{\"context_window\":{\"current_usage\":{\"cache_read_input_tokens\":1000}},\"prompt_cache\":{\"caching_observed\":true,\"warm\":true}}",
+        "{\"context_window\":{\"current_usage\":{\"cache_read_input_tokens\":1000}},\"prompt_cache\":{\"caching_observed\":true,\"warm\":true,\"expires_at\":0}}",
+        "{\"context_window\":{\"current_usage\":{\"cache_read_input_tokens\":1000}},\"prompt_cache\":{\"caching_observed\":true,\"warm\":true,\"expires_at\":-5}}",
+        "{\"context_window\":{\"current_usage\":{\"cache_read_input_tokens\":1000}},\"prompt_cache\":{\"caching_observed\":true,\"warm\":true,\"expires_at\":\"abc\"}}",
+    };
+    inline for (ignored) |json| {
+        const out = try testRender(a.allocator(), json, &env);
+        try std.testing.expectEqualStrings(baseline, out);
+    }
+
+    const cold = try testRender(a.allocator(), "{\"context_window\":{\"current_usage\":{\"cache_read_input_tokens\":1000}},\"prompt_cache\":{\"caching_observed\":true,\"warm\":false}}", &env);
+    try std.testing.expect(std.mem.indexOf(u8, cold, "\x1b[90m@1.0k\x1b[0m \x1b[31mcold\x1b[0m") != null);
+
+    const alone = try testRender(a.allocator(), "{\"prompt_cache\":{\"caching_observed\":true,\"warm\":false}}", &env);
+    try std.testing.expect(std.mem.indexOf(u8, alone, "  \x1b[31mcold\x1b[0m  ") != null);
 }
 
 test "render keeps payload text from reaching the terminal as controls" {
