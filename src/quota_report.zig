@@ -4,6 +4,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const cache = @import("cache.zig");
 const pace_mod = @import("pace.zig");
+const quota = @import("quota.zig");
 
 pub const usage =
     \\gaze quota - every agent's 5h and weekly quota, and whether the weekly will get used.
@@ -32,7 +33,7 @@ pub const specs = [_]Spec{
     .{ .tool = "agy", .short = 2, .weekly = 3, .id = "agy/gemini", .name = "Agy gemini", .fallback = 0.17 },
     .{ .tool = "agy", .short = 4, .weekly = 5, .id = "agy/3p", .name = "Agy 3p", .fallback = 0.34 },
 };
-const Point = struct { pct: i64, reset: i64 };
+const Point = quota.Reading;
 pub const Row = struct { ts: i64, fields: [names.len]?Point = @splat(null) };
 pub const Rows = []const Row;
 const WindowKey = struct { short: i64, weekly: i64 };
@@ -82,7 +83,7 @@ fn digits(raw: []const u8) bool {
     return true;
 }
 
-fn parseLog(a: Allocator, raw: []const u8) !Rows {
+fn parseLog(a: Allocator, raw: []const u8) ![]Row {
     var rows: std.ArrayList(Row) = .empty;
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line| {
@@ -129,7 +130,16 @@ pub fn readLogTail(a: Allocator, io: Io, base: []const u8, tool: []const u8, max
         const end = std.mem.indexOfScalar(u8, data, '\n') orelse return &.{};
         data = data[end + 1 ..];
     }
-    return parseLog(a, data);
+    const rows = try parseLog(a, data);
+    // Start without earlier context, while still expiring fields in the first row.
+    var previous: [names.len]?Point = @splat(null);
+    for (rows) |*row| {
+        for (&row.fields, 0..) |*field, i| {
+            field.* = quota.reconcileWindow(previous[i], field.*, row.ts);
+        }
+        previous = row.fields;
+    }
+    return rows;
 }
 
 // Python round() uses ties to even. Reset stamps are grouped in 120-second bins.
@@ -523,6 +533,62 @@ test "log parsing skips junk and preserves rows with missing fields" {
     try std.testing.expectEqual(@as(i64, 3), rows[0].fields[0].?.pct);
     try std.testing.expect(rows[1].fields[0] == null);
     try std.testing.expect(rows[2].fields[0] == null);
+}
+test "readLogTail reconciles old Claude percentage flips" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const file = try tmp.dir.createFile(io, "quota-claude.log", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "1791736022\t5h=64@1791740400\t7d=35@1792249200\n" ++
+        "1791736027\t5h=64@1791740400\t7d=34@1792249200\n" ++
+        "1791736037\t5h=64@1791740400\t7d=35@1792249200\n");
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path[0..try tmp.dir.realPath(io, &path)];
+    const rows = try readLogTail(a, io, dir, "claude", 4096);
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    for (rows) |row| try std.testing.expectEqual(@as(i64, 35), row.fields[1].?.pct);
+}
+test "readLogTail expires a field in its first row" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const file = try tmp.dir.createFile(io, "quota-claude.log", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "1000\t5h=60@1000\t7d=1@9000\n");
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path[0..try tmp.dir.realPath(io, &path)];
+    const rows = try readLogTail(a, io, dir, "claude", 4096);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expect(rows[0].fields[0] == null);
+    try std.testing.expectEqual(@as(i64, 1), rows[0].fields[1].?.pct);
+}
+test "readLogTail accepts valid rows after an expired first row" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const file = try tmp.dir.createFile(io, "quota-claude.log", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "1000\t5h=60@1000\t7d=1@9000\n" ++
+        "1001\t5h=2@2000\t7d=2@9000\n" ++
+        "1002\t5h=1@2000\t7d=3@9000\n");
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path[0..try tmp.dir.realPath(io, &path)];
+    const rows = try readLogTail(a, io, dir, "claude", 4096);
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    try std.testing.expect(rows[0].fields[0] == null);
+    try std.testing.expectEqual(@as(i64, 2), rows[1].fields[0].?.pct);
+    try std.testing.expectEqual(@as(i64, 2), rows[2].fields[0].?.pct);
+    try std.testing.expectEqual(@as(i64, 3), rows[2].fields[1].?.pct);
 }
 test "learned ratio pools three valid windows and ignores tiny deltas" {
     const rows = try parseLog(std.testing.allocator, "1 5h=0@1200 7d=0@900000\n2 5h=20@1201 7d=4@900001\n" ++

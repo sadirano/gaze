@@ -78,6 +78,11 @@ Each source owns `quota-<source>.log`, which is what keeps two tools sharing one
 gaze from interleaving. Do not merge them back into one file: `tail -1` per
 source is the read that matters, and a source column would put a grep in front
 of every one of them.
+The state file reconciles each named window across sessions before deduping:
+while a window runs, lower usage and missing readings cannot replace its last
+reading. Idle 0% windows also keep their reset against countdown jitter until
+usage appears. Reports, pace, and peers reconcile the log rows they read with
+the same rule; old noisy rows stay on disk.
 
 **A payload shape is not guessable from the outside.** Set `GAZE_DUMP_PAYLOAD`
 to a path and run one session of the tool: it writes the raw stdin there every

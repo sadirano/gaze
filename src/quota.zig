@@ -100,6 +100,167 @@ pub fn formatLine(buf: []u8, s: Sample) ![]const u8 {
 /// moved (a new window) moves by hours.
 pub const reset_tolerance_s: i64 = 120;
 
+pub const Reading = struct { pct: i64, reset: i64 = absent };
+
+/// Keep the most recent credible reading for one named allowance window.
+pub fn reconcileWindow(prev: ?Reading, incoming: ?Reading, now: i64) ?Reading {
+    const inc: ?Reading = if (incoming) |r|
+        (if (r.reset != absent and r.reset <= now) null else r)
+    else
+        null;
+    const old = prev orelse return inc;
+    if (old.reset == absent or (inc != null and inc.?.reset == absent)) return inc;
+    if (now >= old.reset) return inc;
+    const current = inc orelse return old;
+    const delta = @as(i128, current.reset) - old.reset;
+    if (@abs(delta) <= reset_tolerance_s) return if (current.pct > old.pct)
+        .{ .pct = current.pct, .reset = old.reset }
+    else
+        old;
+    if (delta < 0) return old;
+    return if (current.pct > 0) current else old;
+}
+
+test "reconcileWindow rejects expired incoming readings" {
+    const running: Reading = .{ .pct = 35, .reset = 2000 };
+    const expired: Reading = .{ .pct = 20, .reset = 1000 };
+    try std.testing.expectEqualDeep(@as(?Reading, null), reconcileWindow(null, expired, 1000));
+    try std.testing.expectEqualDeep(@as(?Reading, running), reconcileWindow(running, expired, 1000));
+    try std.testing.expectEqualDeep(@as(?Reading, null), reconcileWindow(.{ .pct = 60, .reset = 1000 }, expired, 1001));
+}
+
+test "reconcileWindow accepts first, resetless, and ended windows" {
+    const inc: Reading = .{ .pct = 0, .reset = 3000 };
+    try std.testing.expectEqualDeep(@as(?Reading, inc), reconcileWindow(null, inc, 1000));
+    try std.testing.expectEqualDeep(@as(?Reading, inc), reconcileWindow(.{ .pct = 50 }, inc, 1000));
+    const resetless: Reading = .{ .pct = 5 };
+    try std.testing.expectEqualDeep(@as(?Reading, resetless), reconcileWindow(.{ .pct = 50, .reset = 2000 }, resetless, 1000));
+    try std.testing.expectEqualDeep(@as(?Reading, inc), reconcileWindow(.{ .pct = 50, .reset = 1000 }, inc, 1000));
+    try std.testing.expectEqualDeep(@as(?Reading, null), reconcileWindow(.{ .pct = 50, .reset = 1000 }, null, 1000));
+}
+
+test "reconcileWindow keeps a running window against missing or older readings" {
+    const prev: Reading = .{ .pct = 35, .reset = 2000 };
+    try std.testing.expectEqualDeep(@as(?Reading, prev), reconcileWindow(prev, null, 1000));
+    try std.testing.expectEqualDeep(@as(?Reading, prev), reconcileWindow(prev, .{ .pct = 34, .reset = 2000 }, 1000));
+    try std.testing.expectEqualDeep(@as(?Reading, prev), reconcileWindow(prev, .{ .pct = 35, .reset = 2060 }, 1000));
+    try std.testing.expectEqualDeep(@as(?Reading, prev), reconcileWindow(prev, .{ .pct = 99, .reset = 1879 }, 1000));
+    const rising: Reading = .{ .pct = 36, .reset = 2000 };
+    try std.testing.expectEqualDeep(@as(?Reading, rising), reconcileWindow(prev, rising, 1000));
+    const lower: Reading = .{ .pct = 34, .reset = 2000 };
+    try std.testing.expectEqualDeep(@as(?Reading, prev), reconcileWindow(lower, prev, 1000));
+}
+
+test "reconcileWindow anchors rising usage to the first reset" {
+    const first: Reading = .{ .pct = 60, .reset = 2000 };
+    const raised = reconcileWindow(first, .{ .pct = 61, .reset = 2100 }, 1000);
+    try std.testing.expectEqualDeep(@as(?Reading, .{ .pct = 61, .reset = 2000 }), raised);
+    try std.testing.expectEqualDeep(@as(?Reading, .{ .pct = 1, .reset = 2200 }), reconcileWindow(raised, .{ .pct = 1, .reset = 2200 }, 1000));
+}
+
+test "reconcileWindow waits for usage in a later window" {
+    const idle: Reading = .{ .pct = 0, .reset = 2000 };
+    try std.testing.expectEqualDeep(@as(?Reading, idle), reconcileWindow(idle, .{ .pct = 0, .reset = 2156 }, 1000));
+    try std.testing.expectEqualDeep(@as(?Reading, idle), reconcileWindow(idle, .{ .pct = 0, .reset = 2300 }, 1000));
+    const used: Reading = .{ .pct = 78, .reset = 2000 };
+    const later: Reading = .{ .pct = 78, .reset = 2156 };
+    try std.testing.expectEqualDeep(@as(?Reading, later), reconcileWindow(used, later, 1000));
+    const early: Reading = .{ .pct = 3, .reset = 2300 };
+    try std.testing.expectEqualDeep(@as(?Reading, early), reconcileWindow(idle, early, 1000));
+}
+
+test "reconcileWindow uses wide reset arithmetic for damaged state" {
+    const min = std.math.minInt(i64);
+    const max = std.math.maxInt(i64);
+    const old: Reading = .{ .pct = 35, .reset = max };
+    try std.testing.expectEqualDeep(@as(?Reading, old), reconcileWindow(old, .{ .pct = 34, .reset = min }, 0));
+    try std.testing.expectEqualDeep(@as(?Reading, old), reconcileWindow(old, .{ .pct = 0, .reset = max - 1 }, 0));
+}
+
+fn reading(w: Window) ?Reading {
+    if (w.pct == absent) return null;
+    return .{ .pct = w.pct, .reset = w.reset };
+}
+
+fn matchingIncoming(prev_name: []const u8, incoming: []const Window) ?usize {
+    for (incoming, 0..) |w, i| {
+        var name_buf: [max_name_len]u8 = undefined;
+        const name = writeName(&name_buf, w.name) catch continue;
+        if (std.mem.eql(u8, name, prev_name)) return i;
+    }
+    return null;
+}
+
+/// Reconcile by name while reserving capacity for running previous windows.
+fn reconcileSample(s: Sample, prev: []const Window, out: *[max_windows]Window) Sample {
+    var kept: [max_windows]bool = @splat(false);
+    var reserved: usize = 0;
+    for (prev, 0..) |w, i| {
+        const incoming_index = matchingIncoming(w.name, s.windows);
+        const next = reconcileWindow(reading(w), if (incoming_index) |j| reading(s.windows[j]) else null, s.now);
+        kept[i] = next != null;
+        if (kept[i]) reserved += 1;
+    }
+    var n: usize = 0;
+    var new_count: usize = 0;
+    for (s.windows) |w| {
+        var name_buf: [max_name_len]u8 = undefined;
+        const name = writeName(&name_buf, w.name) catch continue;
+        var old: ?Window = null;
+        for (prev) |p| if (std.mem.eql(u8, p.name, name)) {
+            old = p;
+            break;
+        };
+        const next = reconcileWindow(if (old) |p| reading(p) else null, reading(w), s.now) orelse continue;
+        if (old == null) {
+            if (reserved + new_count >= max_windows) continue;
+            new_count += 1;
+        }
+        if (n >= max_windows) break;
+        out[n] = .{ .name = w.name, .pct = next.pct, .reset = next.reset };
+        n += 1;
+    }
+    for (prev, 0..) |w, i| {
+        if (!kept[i] or matchingIncoming(w.name, s.windows) != null) continue;
+        if (n >= max_windows) break;
+        out[n] = w;
+        n += 1;
+    }
+    var result = s;
+    result.windows = out[0..n];
+    return result;
+}
+
+/// State keys are small; any damaged token makes the previous sample unknown.
+fn parseState(state: ?[]const u8, out: *[max_windows]Window) ?[]const Window {
+    const content = state orelse return null;
+    const tab = std.mem.indexOfScalar(u8, content, '\t') orelse return null;
+    _ = std.fmt.parseInt(i64, std.mem.trim(u8, content[0..tab], " \r\n"), 10) catch return null;
+    const key = std.mem.trim(u8, content[tab + 1 ..], " \t\r\n");
+    if (key.len == 0) return null;
+    var fields = std.mem.tokenizeScalar(u8, key, ' ');
+    var n: usize = 0;
+    while (fields.next()) |field| {
+        if (n >= max_windows) return null;
+        const eq = std.mem.indexOfScalar(u8, field, '=') orelse return null;
+        if (eq == 0 or eq > max_name_len) return null;
+        for (field[0..eq]) |c| switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '.', '_', '-' => {},
+            else => return null,
+        };
+        const at = std.mem.indexOfScalarPos(u8, field, eq + 1, '@');
+        const pct = std.fmt.parseInt(i64, field[eq + 1 .. at orelse field.len], 10) catch return null;
+        const reset = if (at) |i| std.fmt.parseInt(i64, field[i + 1 ..], 10) catch return null else absent;
+        out[n] = .{ .name = field[0..eq], .pct = pct, .reset = reset };
+        n += 1;
+    }
+    return out[0..n];
+}
+
+fn reconcileState(s: Sample, state: ?[]const u8, prev_buf: *[max_windows]Window, out: *[max_windows]Window) Sample {
+    return reconcileSample(s, parseState(state, prev_buf) orelse &.{}, out);
+}
+
 /// The part of a sample that decides whether it is worth writing: each window's
 /// name, percentage and reset, as `name=pct@reset` separated by spaces.
 /// `shouldWrite` compares resets with `reset_tolerance_s` of slack.
@@ -217,10 +378,6 @@ pub fn record(
     min_interval_s: i64,
 ) void {
     var key_buf: [max_windows * (max_name_len + 32)]u8 = undefined;
-    const key = stateKey(&key_buf, s) catch return;
-    // Nothing to record: a payload with no usable window is the one case where a
-    // sample would be pure noise.
-    if (key.len == 0) return;
 
     var src_buf: [max_name_len]u8 = undefined;
     const src = writeName(&src_buf, s.source) catch return;
@@ -229,6 +386,12 @@ pub fn record(
     const state_path = std.fmt.allocPrint(arena, "{s}{c}quota-{s}.state", .{ dir, std.fs.path.sep, src }) catch return;
 
     const state = Io.Dir.cwd().readFileAlloc(io, state_path, arena, .limited(1024)) catch null;
+    var pre_prev: [max_windows]Window = undefined;
+    var pre_windows: [max_windows]Window = undefined;
+    const pre = reconcileState(s, state, &pre_prev, &pre_windows);
+    const key = stateKey(&key_buf, pre) catch return;
+    // Nothing to record when reconciliation leaves no usable window.
+    if (key.len == 0) return;
     if (!shouldWrite(state, s.now, key, min_interval_s)) return;
 
     // Only now is the directory worth creating - the common path touches nothing.
@@ -250,7 +413,12 @@ pub fn record(
     const held_n = lock.readPositionalAll(io, &held_buf, 0) catch return;
     // An empty state file is one this call just created: no state.
     const held: ?[]const u8 = if (held_n == 0) null else held_buf[0..held_n];
-    if (!shouldWrite(held, s.now, key, min_interval_s)) return;
+    var held_prev: [max_windows]Window = undefined;
+    var held_windows: [max_windows]Window = undefined;
+    const reconciled = reconcileState(s, held, &held_prev, &held_windows);
+    const held_key = stateKey(&key_buf, reconciled) catch return;
+    if (held_key.len == 0) return;
+    if (!shouldWrite(held, s.now, held_key, min_interval_s)) return;
     if (s.only_if_newer) {
         if (lastLogTime(io, log_path)) |last| if (s.now <= last) return;
     }
@@ -260,13 +428,13 @@ pub fn record(
     if (held == null) retireUnsourcedLog(arena, io, dir);
 
     var line_buf: [512]u8 = undefined;
-    const line = formatLine(&line_buf, s) catch return;
+    const line = formatLine(&line_buf, reconciled) catch return;
     append(io, log_path, line) catch return;
 
     // State last: if this fails the next render simply re-samples, which is a
     // duplicate line rather than a lost one.
     var state_buf: [key_buf.len + 32]u8 = undefined;
-    const state_line = std.fmt.bufPrint(&state_buf, "{d}\t{s}", .{ s.now, key }) catch return;
+    const state_line = std.fmt.bufPrint(&state_buf, "{d}\t{s}", .{ s.now, held_key }) catch return;
     lock.writePositionalAll(io, state_line, 0) catch return;
     lock.setLength(io, state_line.len) catch {};
 }
@@ -490,6 +658,130 @@ test "record writes a moved sample once and keeps the state in step" {
     );
     const state = try tmp.dir.readFileAlloc(io, "quota-claude.state", g, .limited(4096));
     try std.testing.expectEqualStrings("1010\t5h=5@1789942200 7d=47@1790434800", state);
+}
+
+test "record suppresses Claude session percentage flips" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path[0..try tmp.dir.realPath(io, &path)];
+    const first = [_]Window{ .{ .name = "5h", .pct = 64, .reset = 1791740400 }, .{ .name = "7d", .pct = 35, .reset = 1792249200 } };
+    const stale = [_]Window{ first[0], .{ .name = "7d", .pct = 34, .reset = 1792249200 } };
+    record(a, io, dir, .{ .now = 1791736022, .source = "claude", .windows = &first }, 300);
+    record(a, io, dir, .{ .now = 1791736027, .source = "claude", .windows = &stale }, 300);
+    record(a, io, dir, .{ .now = 1791736037, .source = "claude", .windows = &first }, 300);
+    const log = try tmp.dir.readFileAlloc(io, "quota-claude.log", a, .limited(4096));
+    try std.testing.expectEqualStrings("1791736022\t5h=64@1791740400\t7d=35@1792249200\n", log);
+}
+
+test "record keeps each window's highest same-window usage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path[0..try tmp.dir.realPath(io, &path)];
+    const first = [_]Window{ .{ .name = "5h", .pct = 60, .reset = 2000 }, .{ .name = "7d", .pct = 35, .reset = 9000 } };
+    const mixed = [_]Window{ .{ .name = "5h", .pct = 61, .reset = 2000 }, .{ .name = "7d", .pct = 34, .reset = 9000 } };
+    record(a, io, dir, .{ .now = 1000, .source = "claude", .windows = &first }, 300);
+    record(a, io, dir, .{ .now = 1010, .source = "claude", .windows = &mixed }, 300);
+    const log = try tmp.dir.readFileAlloc(io, "quota-claude.log", a, .limited(4096));
+    try std.testing.expectEqualStrings("1000\t5h=60@2000\t7d=35@9000\n1010\t5h=61@2000\t7d=35@9000\n", log);
+}
+
+test "record suppresses Agy idle reset jitter and stale session usage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path[0..try tmp.dir.realPath(io, &path)];
+    const t: i64 = 1791529436;
+    const samples = [_][2]Window{
+        .{ .{ .name = "3p-5h", .pct = 0, .reset = 1791540040 }, .{ .name = "gemini-5h", .pct = 78, .reset = 1791537062 } },
+        .{ .{ .name = "3p-5h", .pct = 0, .reset = 1791540120 }, .{ .name = "gemini-5h", .pct = 81, .reset = 1791537062 } },
+        .{ .{ .name = "3p-5h", .pct = 0, .reset = 1791540040 }, .{ .name = "gemini-5h", .pct = 78, .reset = 1791537062 } },
+        .{ .{ .name = "3p-5h", .pct = 0, .reset = 1791540196 }, .{ .name = "gemini-5h", .pct = 82, .reset = 1791537062 } },
+    };
+    for (samples, 0..) |sample, i| record(a, io, dir, .{ .now = t + @as(i64, @intCast(i)), .source = "agy", .windows = &sample }, 300);
+    const log = try tmp.dir.readFileAlloc(io, "quota-agy.log", a, .limited(4096));
+    try std.testing.expectEqualStrings(
+        "1791529436\t3p-5h=0@1791540040\tgemini-5h=78@1791537062\n" ++
+            "1791529437\t3p-5h=0@1791540040\tgemini-5h=81@1791537062\n" ++
+            "1791529439\t3p-5h=0@1791540040\tgemini-5h=82@1791537062\n",
+        log,
+    );
+}
+
+test "record writes heartbeat for an unchanged reconciled reading" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path[0..try tmp.dir.realPath(io, &path)];
+    const first = [_]Window{.{ .name = "5h", .pct = 35, .reset = 2000 }};
+    const stale = [_]Window{.{ .name = "5h", .pct = 34, .reset = 2000 }};
+    record(a, io, dir, .{ .now = 1000, .source = "claude", .windows = &first }, 300);
+    record(a, io, dir, .{ .now = 1300, .source = "claude", .windows = &stale }, 300);
+    const log = try tmp.dir.readFileAlloc(io, "quota-claude.log", a, .limited(4096));
+    try std.testing.expectEqualStrings("1000\t5h=35@2000\n1300\t5h=35@2000\n", log);
+}
+
+test "record never restores a reading past its reset" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path[0..try tmp.dir.realPath(io, &path)];
+    const first = [_]Window{ .{ .name = "5h", .pct = 60, .reset = 1000 }, .{ .name = "7d", .pct = 1, .reset = 9000 } };
+    const second = [_]Window{ .{ .name = "5h", .pct = 20, .reset = 1000 }, .{ .name = "7d", .pct = 2, .reset = 9000 } };
+    const third = [_]Window{ .{ .name = "5h", .pct = 60, .reset = 1000 }, .{ .name = "7d", .pct = 3, .reset = 9000 } };
+    record(a, io, dir, .{ .now = 990, .source = "claude", .windows = &first }, 300);
+    record(a, io, dir, .{ .now = 1001, .source = "claude", .windows = &second }, 300);
+    record(a, io, dir, .{ .now = 1002, .source = "claude", .windows = &third }, 300);
+    const log = try tmp.dir.readFileAlloc(io, "quota-claude.log", a, .limited(4096));
+    try std.testing.expectEqualStrings("990\t5h=60@1000\t7d=1@9000\n1001\t7d=2@9000\n1002\t7d=3@9000\n", log);
+}
+
+test "held state wins a writer race and preserves its newer percentage" {
+    const incoming = [_]Window{.{ .name = "7d", .pct = 35, .reset = 2000 }};
+    const s: Sample = .{ .now = 1010, .source = "claude", .windows = &incoming };
+    var prev_buf: [max_windows]Window = undefined;
+    var out: [max_windows]Window = undefined;
+    var key_buf: [128]u8 = undefined;
+    const pre = reconcileState(s, "700\t7d=34@2000", &prev_buf, &out);
+    try std.testing.expect(shouldWrite("700\t7d=34@2000", s.now, try stateKey(&key_buf, pre), 300));
+    const held = reconcileState(s, "705\t7d=36@2000", &prev_buf, &out);
+    const key = try stateKey(&key_buf, held);
+    try std.testing.expectEqualStrings("7d=36@2000", key);
+    var line_buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("1010\t7d=36@2000\n", try formatLine(&line_buf, held));
+    try std.testing.expect(shouldWrite("705\t7d=36@2000", s.now, key, 300));
+}
+
+test "reconcileSample reserves capacity for running previous windows" {
+    var prev: [max_windows]Window = undefined;
+    for (&prev, 0..) |*w, i| w.* = .{ .name = (&[_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" })[i], .pct = 1, .reset = 2000 };
+    const incoming = [_]Window{.{ .name = "new", .pct = 2, .reset = 2000 }};
+    var out: [max_windows]Window = undefined;
+    const result = reconcileSample(.{ .now = 1000, .source = "agy", .windows = &incoming }, &prev, &out);
+    try std.testing.expectEqual(@as(usize, max_windows), result.windows.len);
+    try std.testing.expectEqualStrings("a", result.windows[0].name);
+    try std.testing.expectEqualStrings("h", result.windows[max_windows - 1].name);
 }
 
 test "record with only_if_newer never puts an older sample last" {

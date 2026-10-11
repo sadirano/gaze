@@ -29,7 +29,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, mode, "empty")) {
         try out.writeStreamingAll(io, "{\"id\":2,\"result\":{\"rateLimitsByLimitId\":{}}}\n");
     } else {
-        try out.writeStreamingAll(io, "{\"id\":2,\"result\":{\"rateLimitsByLimitId\":{\"codex\":{\"primary\":{\"usedPercent\":19,\"windowDurationMins\":300,\"resetsAt\":1789943916},\"secondary\":{\"usedPercent\":3,\"windowDurationMins\":10080}}}}}\n");
+        try out.writeStreamingAll(io, "{\"id\":2,\"result\":{\"rateLimitsByLimitId\":{\"codex\":{\"primary\":{\"usedPercent\":19,\"windowDurationMins\":300,\"resetsAt\":4102444800},\"secondary\":{\"usedPercent\":3,\"windowDurationMins\":10080}}}}}\n");
     }
     // Remain alive so the test exercises collector cleanup, not just natural exit.
     _ = try reader.interface.takeDelimiter('\n');

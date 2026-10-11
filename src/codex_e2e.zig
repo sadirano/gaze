@@ -37,7 +37,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.indexOf(u8, res.stderr, "PRIVATE-DIAGNOSTIC") != null) return error.DiagnosticLeak;
         const content = try cwd.readFileAlloc(io, log, a, .limited(2048));
         if (std.mem.count(u8, content, "\n") != 1) return error.DedupeFailed;
-        if (std.mem.indexOf(u8, content, "\t5h=19@1789943916\t7d=3\n") == null) return error.WrongQuota;
+        if (std.mem.indexOf(u8, content, "\t5h=19@4102444800\t7d=3\n") == null) return error.WrongQuota;
         if (std.mem.eql(u8, mode, "stall") and std.mem.indexOf(u8, res.stderr, "CodexTimeout") == null) return error.MissingTimeout;
         count += 1;
     }
