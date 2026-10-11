@@ -221,6 +221,22 @@ this shape. The first write after the upgrade renames it to `quota-v1.log`
 (never over an existing one) and deletes the old `quota.state`; the per-source
 files start fresh.
 
+## Querying quota history
+
+`gaze-db` builds a disposable SQLite query index from the quota logs:
+
+```
+gaze-db sync
+gaze-db rows claude --since 1791742480
+gaze-db query "select source,count(*) from records group by source"
+gaze-db rebuild
+```
+
+`rows` emits JSONL, `query` emits TSV, and both sync first. `--stale` allows
+either read to use the last compatible index if a sync fails. Set
+`GAZE_QUOTA_DIR` to select the log directory and `GAZE_DB_WAIT_MS` to change
+the database busy timeout (default 10000 ms).
+
 ## How much the other tools have used
 
 Every source writes `quota-<source>.log`, so the tools' levels already sit on

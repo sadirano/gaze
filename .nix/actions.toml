@@ -17,3 +17,4 @@ quota-mark = "python -I scripts/quota_mark.py {args}"
 # Globally runnable via ~/.nix/bin (installed by `nix --sync-bin`).
 [bin]
 gaze = "zig-out/bin/gaze.exe"
+gaze-db = "zig-out/bin/gaze-db.exe"

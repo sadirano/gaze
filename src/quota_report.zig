@@ -83,31 +83,35 @@ fn digits(raw: []const u8) bool {
     return true;
 }
 
+pub fn parseLine(line: []const u8) ?Row {
+    var parts = std.mem.tokenizeAny(u8, line, " \t\r\x0b\x0c");
+    const stamp = parts.next() orelse return null;
+    const first = parts.next() orelse return null;
+    if (!digits(stamp)) return null;
+    const ts = std.fmt.parseInt(i64, stamp, 10) catch return null;
+    var row: Row = .{ .ts = ts };
+    var item: ?[]const u8 = first;
+    while (item) |field| : (item = parts.next()) {
+        const eq = std.mem.indexOfScalar(u8, field, '=') orelse continue;
+        const at_rel = std.mem.indexOfScalar(u8, field[eq + 1 ..], '@') orelse continue;
+        const at = eq + 1 + at_rel;
+        const pct_raw = field[eq + 1 .. at];
+        const reset_raw = field[at + 1 ..];
+        if (!digits(pct_raw) or !digits(reset_raw)) continue;
+        const pct = std.fmt.parseInt(i64, pct_raw, 10) catch continue;
+        const reset = std.fmt.parseInt(i64, reset_raw, 10) catch continue;
+        for (names, 0..) |name, i| {
+            if (std.mem.eql(u8, field[0..eq], name)) row.fields[i] = .{ .pct = pct, .reset = reset };
+        }
+    }
+    return row;
+}
+
 fn parseLog(a: Allocator, raw: []const u8) ![]Row {
     var rows: std.ArrayList(Row) = .empty;
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line| {
-        var parts = std.mem.tokenizeAny(u8, line, " \t\r\x0b\x0c");
-        const stamp = parts.next() orelse continue;
-        const first = parts.next() orelse continue;
-        if (!digits(stamp)) continue;
-        const ts = std.fmt.parseInt(i64, stamp, 10) catch continue;
-        var row: Row = .{ .ts = ts };
-        var item: ?[]const u8 = first;
-        while (item) |field| : (item = parts.next()) {
-            const eq = std.mem.indexOfScalar(u8, field, '=') orelse continue;
-            const at_rel = std.mem.indexOfScalar(u8, field[eq + 1 ..], '@') orelse continue;
-            const at = eq + 1 + at_rel;
-            const pct_raw = field[eq + 1 .. at];
-            const reset_raw = field[at + 1 ..];
-            if (!digits(pct_raw) or !digits(reset_raw)) continue;
-            const pct = std.fmt.parseInt(i64, pct_raw, 10) catch continue;
-            const reset = std.fmt.parseInt(i64, reset_raw, 10) catch continue;
-            for (names, 0..) |name, i| {
-                if (std.mem.eql(u8, field[0..eq], name)) row.fields[i] = .{ .pct = pct, .reset = reset };
-            }
-        }
-        try rows.append(a, row);
+        if (parseLine(line)) |row| try rows.append(a, row);
     }
     return rows.toOwnedSlice(a);
 }
@@ -289,7 +293,7 @@ fn measureWithPlan(a: Allocator, rows: Rows, spec: Spec, now: i64, hours: f64, t
     } };
 }
 
-fn envDir(a: Allocator, env: *const std.process.Environ.Map) ![]const u8 {
+pub fn envDir(a: Allocator, env: *const std.process.Environ.Map) ![]const u8 {
     if (env.get("GAZE_QUOTA_DIR")) |d| if (d.len > 0) return d;
     const base = env.get("LOCALAPPDATA") orelse env.get("XDG_STATE_HOME") orelse env.get("HOME") orelse return ".";
     return std.fs.path.join(a, &.{ base, "gaze" });

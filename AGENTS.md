@@ -31,3 +31,4 @@ not a preference; `x gaze :build` adds `nix --sync-bin`) and `zig build test`
   payloads, including a sibling dir sharing an alias prefix.
 - Cast to unsigned before `{d:0>2}`. The settings `statusLine` path uses
   forward slashes.
+- gaze.exe never links SQLite; quota.db is a cache owned by gaze-db, rebuilt from the logs.

@@ -125,6 +125,16 @@ tests. Missing logs appear as unsampled buckets; this command is never called
 from the status-line render path (its log parser and ratio learner are, through
 `pace.zig`, behind the pace cache).
 
+## gaze-db
+
+`gaze-db` is a separate SQLite-linked executable that indexes the per-source
+quota logs into `quota.db` beside them. The logs remain authoritative, and a
+`rows` or `query` call syncs the index before reading it. `gaze.exe` does not
+link SQLite or call this executable on a render. The schema starts at version
+1 (`PRAGMA user_version`); the reconcile `rule_version` starts at 1 in
+`src/db.zig`. Bump `rule_version` whenever `parseLine` or
+`quota.reconcileWindow` changes meaning, so the next sync rebuilds the index.
+
 ## Pace glyphs
 
 `QUOTA_PLAN_<TOOL>=<days>d:<pct>` sets a weekly target for Claude, Codex, or
