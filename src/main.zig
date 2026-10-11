@@ -39,6 +39,8 @@ const usage =
     \\  --hoot-ttl <seconds>   how often to re-check that count
     \\                         (default 10; 0 re-checks on every render)
     \\  --no-hoot              never check hoot, even with GAZE_HOOT=1
+    \\  --cache-warn <minutes> with hoot on, hoot once when the prompt cache has
+    \\                         this long left (default 10; 0 never)
     \\  --no-quota-log         write no quota log at all: neither this tool's
     \\                         samples nor Codex's, read from its transcripts
     \\  --source <name>        file the quota samples under this tool's name
@@ -53,8 +55,8 @@ const usage =
     \\  --no-pace              drop the pace glyph after each quota level
     \\  -h, --help             this text
     \\
-    \\GAZE_DIRTY_TTL, GAZE_HOOT_TTL, GAZE_CODEX_TTL, GAZE_PACE_TTL and GAZE_SOURCE
-    \\set the same intervals and name, and GAZE_HOOT=1 turns the hoot badge on;
+    \\GAZE_DIRTY_TTL, GAZE_HOOT_TTL, GAZE_CODEX_TTL, GAZE_PACE_TTL, GAZE_CACHE_WARN
+    \\and GAZE_SOURCE set the same intervals and name, and GAZE_HOOT=1 turns the hoot badge on;
     \\flags win.
     \\
     \\Each of this tool's quota levels carries a pace glyph: `=` on an even burn,
@@ -144,6 +146,8 @@ const Config = struct {
     /// Also show each peer's weekly pace glyph. Opt-in: it costs a log tail
     /// read per peer, and the peers are meant to stay a glance by default.
     peer_pace: bool = false,
+    /// With hoot on, minutes before the prompt cache expires to hoot about it.
+    cache_warn_min: u32 = 10,
     codex_ttl_s: u32 = default_codex_ttl_s,
     pace: bool = true,
     pace_ttl_s: u32 = default_pace_ttl_s,
@@ -207,6 +211,7 @@ fn parseArgs(
     if (envTtl(env, "GAZE_HOOT_TTL")) |n| cfg.hoot_ttl_s = n;
     if (envTtl(env, "GAZE_CODEX_TTL")) |n| cfg.codex_ttl_s = n;
     if (envTtl(env, "GAZE_PACE_TTL")) |n| cfg.pace_ttl_s = n;
+    if (envTtl(env, "GAZE_CACHE_WARN")) |n| cfg.cache_warn_min = n;
     if (env.get("GAZE_HOOT")) |v| cfg.check_hoot = std.mem.eql(u8, std.mem.trim(u8, v, " \t"), "1");
     if (env.get("GAZE_PEER_PACE")) |v| cfg.peer_pace = std.mem.eql(u8, std.mem.trim(u8, v, " \t"), "1");
     if (env.get("GAZE_SOURCE")) |s| {
@@ -257,6 +262,10 @@ fn parseArgs(
         }
         if (try ttlFlag(args, &i, "--codex-ttl")) |n| {
             cfg.codex_ttl_s = n;
+            continue;
+        }
+        if (try ttlFlag(args, &i, "--cache-warn")) |n| {
+            cfg.cache_warn_min = n;
             continue;
         }
         if (try ttlFlag(args, &i, "--pace-ttl")) |n| {
@@ -518,6 +527,11 @@ fn render(
                 if (expires_at > 0) {
                     const ttl = if (strAt(root, &.{ "prompt_cache", "ttl" })) |raw| ttlSeconds(raw) else null;
                     cache_state = cacheLeft(now, expires_at, ttl);
+                    if (cfg.check_hoot and hoot_mod.coldSoon(now, expires_at, ttl, @as(i64, cfg.cache_warn_min) * 60)) {
+                        if (strAt(root, &.{"session_id"})) |session| {
+                            hoot_mod.warnCacheCold(arena, io, tmpDir(env), session, sessionLabel(env, cwd), expires_at, now);
+                        }
+                    }
                 }
             }
         }
@@ -898,6 +912,13 @@ fn localHhMm(arena: std.mem.Allocator, io: Io) ![]const u8 {
     return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}", .{ secs / 3600, secs % 3600 / 60 });
 }
 
+/// What a hoot names the session by: its nix alias, else the folder name.
+fn sessionLabel(env: *std.process.Environ.Map, cwd: []const u8) []const u8 {
+    if (env.get("NIX_ALIAS")) |a| if (a.len > 0) return a;
+    const base = std.fs.path.basename(cwd);
+    return if (base.len > 0) base else "claude";
+}
+
 /// Where the dirty cache lives. Falls back to the current directory rather than
 /// failing, since a missing cache only costs a git call.
 fn tmpDir(env: *std.process.Environ.Map) []const u8 {
@@ -1008,6 +1029,7 @@ fn numAt(root: std.json.Value, path: []const []const u8) ?f64 {
 // Pull the modules' own tests into `zig build test`: a file's tests only run
 // when something in the test root references it.
 test {
+    _ = hoot_mod;
     _ = codex_quota;
     _ = quota_report;
     _ = pace;

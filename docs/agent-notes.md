@@ -162,6 +162,12 @@ Code reports when caching has been observed. A cold cache shows `cold`; the
 countdown describes the reported expiry, not a promise that the next request
 will hit the cache.
 
+With hoot on, the render also hoots once per cache window when the time left
+drops under `--cache-warn` minutes (default 10), so a session left alone can
+be picked up while warm. A marker in TEMP keyed by session id holds the expiry
+already warned about; it is written before the spawn, so the spawn happens at
+most once per window. A TTL not above twice the lead (a 5m cache) never warns.
+
 The unit tests cover the formatting helpers (cost grouping, token suffixes,
 duration units, the alias-relative path, HEAD parsing, cache staleness). They do
 not cover the assembled line.

@@ -57,3 +57,62 @@ fn spawn(arena: std.mem.Allocator, io: Io) ?i64 {
     }
     return std.fmt.parseInt(i64, std.mem.trim(u8, res.stdout, " \t\r\n"), 10) catch null;
 }
+
+/// Whether the prompt cache is close enough to expiring to warn about it.
+/// Only a known TTL well above the lead counts: with a 5m cache a 10m lead
+/// would fire right after every turn.
+pub fn coldSoon(now: i64, expires_at: i64, ttl_s: ?i64, lead_s: i64) bool {
+    if (lead_s <= 0) return false;
+    const ttl = ttl_s orelse return false;
+    if (ttl <= 2 * lead_s) return false;
+    const remaining = std.math.sub(i64, expires_at, now) catch return false;
+    return remaining > 0 and remaining <= lead_s;
+}
+
+/// Hoots once per cache window that this session's prompt cache goes cold
+/// soon, so a session left alone is picked up while it is still warm. The
+/// marker (session -> expiry already warned about) is written before the
+/// spawn, so a failing hoot costs one spawn per window, never one per render.
+pub fn warnCacheCold(
+    arena: std.mem.Allocator,
+    io: Io,
+    tmp_dir: []const u8,
+    session: []const u8,
+    label: []const u8,
+    expires_at: i64,
+    now: i64,
+) void {
+    const path = cache.pathFor(arena, tmp_dir, "cachewarn", session) catch return;
+    var key_buf: [32]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{d}", .{expires_at}) catch return;
+    // Any age: the expiry itself is the key, so the TTL only has to outlive it.
+    if (cache.read(arena, io, path, std.math.maxInt(u32), now)) |seen| {
+        if (std.mem.eql(u8, seen, key)) return;
+    }
+    cache.write(io, path, key, now) catch return;
+
+    const minutes = @max(1, @divTrunc(expires_at - now + 59, 60));
+    const msg = std.fmt.allocPrint(arena, "{s}: prompt cache goes cold in {d}m", .{ label, minutes }) catch return;
+    _ = std.process.run(arena, io, .{
+        .argv = &.{ "hoot", "send", msg, "--tag", "claude", "--level", "warn" },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+        .timeout = .{ .duration = .{ .raw = .fromMilliseconds(send_timeout_ms), .clock = .awake } },
+    }) catch {};
+}
+
+/// A send toasts, so it gets longer than a count; it runs once an hour at most.
+const send_timeout_ms = 3000;
+
+test "coldSoon warns inside the lead, only for a TTL well above it" {
+    try std.testing.expect(coldSoon(1000, 1000 + 600, 3600, 600));
+    try std.testing.expect(coldSoon(1000, 1000 + 1, 3600, 600));
+    try std.testing.expect(!coldSoon(1000, 1000 + 601, 3600, 600));
+    try std.testing.expect(!coldSoon(1000, 1000, 3600, 600));
+    try std.testing.expect(!coldSoon(1000, 900, 3600, 600));
+    try std.testing.expect(!coldSoon(1000, 1100, 300, 600));
+    try std.testing.expect(!coldSoon(1000, 1100, 1200, 600));
+    try std.testing.expect(!coldSoon(1000, 1100, null, 600));
+    try std.testing.expect(!coldSoon(1000, 1100, 3600, 0));
+    try std.testing.expect(!coldSoon(std.math.minInt(i64), std.math.maxInt(i64), 3600, 600));
+}
